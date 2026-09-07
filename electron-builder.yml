@@ -1,5 +1,7 @@
 # electron-builder 打包配置
 # 打包命令：npm run dist（当前平台）/ dist:mac / dist:win
+# publish: null 显式关闭自动发布——否则 CI 环境会默认尝试发布到 GitHub Releases 并要求 GH_TOKEN
+publish: null
 appId: com.vlearn.app
 productName: Vlearn教培管理系统
 # 安装包文件名保持 ASCII，避免中文文件名在部分系统引起问题

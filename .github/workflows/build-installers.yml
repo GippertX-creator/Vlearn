@@ -1,0 +1,63 @@
+# 云端构建安装包（GitHub Actions）
+# 使用方式：把项目推送到 GitHub 私有仓库 → 网页进入 Actions → 选择本工作流 → Run workflow
+# 构建完成后在运行页面的 Artifacts 里下载 exe / dmg
+# 云端服务器直连 GitHub 速度快，用环境变量覆盖本地 .npmrc 的国内镜像配置
+name: 构建安装包（Windows + macOS）
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+
+env:
+  ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+  npm_config_electron_mirror: https://github.com/electron/electron/releases/download/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: 安装依赖（含 better-sqlite3 原生编译）
+        run: npm ci
+
+      - name: 构建 Windows 安装包
+        run: npm run dist:win
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlearn-windows-installer
+          path: release/*.exe
+          retention-days: 30
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: 安装依赖（含 better-sqlite3 原生编译）
+        run: npm ci
+
+      - name: 构建 macOS 安装包
+        run: npm run dist:mac
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlearn-macos-installer
+          path: release/*.dmg
+          retention-days: 30

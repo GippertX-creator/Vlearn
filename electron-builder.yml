@@ -1,0 +1,33 @@
+# electron-builder 打包配置
+# 打包命令：npm run dist（当前平台）/ dist:mac / dist:win
+appId: com.vlearn.app
+productName: Vlearn教培管理系统
+# 安装包文件名保持 ASCII，避免中文文件名在部分系统引起问题
+artifactName: vlearn-${version}-${os}-${arch}.${ext}
+directories:
+  buildResources: build
+  output: release
+# 只打包构建产物与运行时依赖（better-sqlite3 等原生模块在 dependencies 中）
+files:
+  - out/**
+  - package.json
+# 原生模块必须解出 asar 才能被 require 加载
+asarUnpack:
+  - node_modules/better-sqlite3/**
+# 默认会对原生依赖执行 rebuild（针对 Electron ABI）
+npmRebuild: true
+mac:
+  category: public.app-category.education
+  target:
+    - dmg
+win:
+  target:
+    - nsis
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: Vlearn教培管理系统
+linux:
+  target:
+    - AppImage
+  category: Education

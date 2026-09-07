@@ -1,0 +1,13 @@
+node_modules/
+out/
+release/
+dist/
+*.log
+.DS_Store
+.vite/
+
+# 本地产物与工具目录，不纳入仓库
+.claude/
+.doc-temp.html
+使用说明书.pdf
+vlearn-windows-build-source.zip

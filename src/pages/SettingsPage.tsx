@@ -38,6 +38,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 export default function SettingsPage(): JSX.Element {
   const { message } = AntdApp.useApp()
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
+  const [appVersion, setAppVersion] = useState('')
   const [loading, setLoading] = useState(true)
   const [baseSaving, setBaseSaving] = useState(false)
   const [ruleSaving, setRuleSaving] = useState(false)
@@ -48,8 +49,11 @@ export default function SettingsPage(): JSX.Element {
     let mounted = true
     ;(async () => {
       try {
-        const s = await api.getSettings()
-        if (mounted) setSettings(s)
+        const [s, v] = await Promise.all([api.getSettings(), api.getAppVersion()])
+        if (mounted) {
+          setSettings(s)
+          setAppVersion(v)
+        }
       } catch (err) {
         message.error(getErrorMessage(err))
       } finally {
@@ -291,7 +295,7 @@ export default function SettingsPage(): JSX.Element {
         {/* e) 关于 */}
         <Card title="关于">
           <Typography.Paragraph style={{ marginBottom: 4 }}>
-            <Typography.Text strong>Vlearn</Typography.Text> 教培管理系统 · 版本 1.0.0
+            <Typography.Text strong>Vlearn</Typography.Text> 教培管理系统 · 版本 {appVersion || '—'}
           </Typography.Paragraph>
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
             面向教培机构的本地教务与财务管理系统。所有数据保存在本机数据库中，不会上传网络，可离线使用。

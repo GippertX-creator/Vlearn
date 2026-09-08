@@ -140,6 +140,7 @@ const api: VlearnApi = {
   // ---------- 设置 ----------
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (data: AppSettings) => ipcRenderer.invoke('settings:save', data),
+  getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
   backupData: () => ipcRenderer.invoke('backup:create'),
   restoreData: () => ipcRenderer.invoke('backup:restore'),
 

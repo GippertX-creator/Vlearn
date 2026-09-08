@@ -7,7 +7,7 @@
  * - 财务相关 IPC 均先经过 ensureFinance() 校验主进程内的财务会话标记，
  *   该标记仅能通过 finance:verifyPassword 校验密码后置位。
  */
-import { BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import Database from 'better-sqlite3'
 import fs from 'node:fs'
 import { format } from 'date-fns'
@@ -1050,6 +1050,9 @@ function registerSettingsHandlers(): void {
       chargeAbsent: (getSetting('charge_absent') ?? '1') === '1'
     }
   })
+
+  // 应用版本号（打包后读取自安装包内的 package.json，用于"关于"页展示）
+  ipcMain.handle('app:getVersion', (): string => app.getVersion())
 
   ipcMain.handle('settings:save', (_e, data: AppSettings): void => {
     const grades = (data.grades ?? []).map(String).filter((s) => s.trim())

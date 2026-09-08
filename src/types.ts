@@ -344,6 +344,8 @@ export interface VlearnApi {
   // ---------- 设置 ----------
   getSettings(): Promise<AppSettings>
   saveSettings(data: AppSettings): Promise<void>
+  /** 应用版本号（读取自 package.json，用于"关于"页展示，便于确认用户安装的版本） */
+  getAppVersion(): Promise<string>
   backupData(): Promise<BackupResult>
   restoreData(): Promise<BackupResult>
 

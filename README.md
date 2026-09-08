@@ -1,6 +1,8 @@
 # Vlearn 教培管理系统
 
-面向教培机构的本地桌面应用（Windows / macOS）：教务管理、考勤管理、财务管理、报表导出四大模块，数据存储于本地 SQLite，无需联网。教务与财务数据严格隔离，财务模块需二次密码验证。
+面向教培机构的本地桌面应用（Windows / macOS）：教务管理、考勤管理、财务管理、助教协作、报表导出五大模块，数据存储于本地 SQLite，无需联网。
+
+**v2 特性**：教务 / 财务 / 助教三种角色，各自使用**独立的物理数据库**（数据隔离），内置教务 Agent 与财务 Agent（排课冲突检测、考勤异常提醒、对账检查、异常交易检测、AI 报告等），助教模块支持课程内容记录与基于外部大模型的微信群短信生成。
 
 > 面向普通用户的操作指南见 [使用说明书.md](./使用说明书.md)。
 
@@ -10,183 +12,153 @@
 | --- | --- |
 | 桌面框架 | Electron 33（主进程 + 渲染进程，contextIsolation 隔离） |
 | 前端 | React 18 + TypeScript + Vite，Ant Design 5（中文界面） |
-| 数据库 | SQLite（`better-sqlite3`，仅在主进程同步操作） |
+| 数据库 | SQLite（`better-sqlite3`，仅在主进程操作；三个角色三个库文件） |
 | 进程通信 | Electron IPC（渲染进程仅通过 preload 暴露的 `window.api` 调用） |
 | Excel 导出 | `exceljs`（主进程生成工作簿 + 保存对话框） |
-| 日期处理 | `date-fns`（主进程排课计算）、`dayjs`（渲染进程，antd 5 依赖） |
-| 打包 | electron-builder（dmg / nsis） |
-| 构建 | electron-vite（main / preload / renderer 三段构建） |
+| 大模型接入 | 主进程 `fetch` 调用 OpenAI 兼容 API（DeepSeek/通义/GPT 等，配置于各角色设置） |
+| 日期处理 | `date-fns`（主进程）、`dayjs`（渲染进程） |
+| 打包 / 构建 | electron-builder（dmg / nsis）/ electron-vite |
 
 ## 目录结构
 
 ```
-├── electron/                    # Electron 主进程（Node 环境）
-│   ├── main.ts                  # 入口：创建窗口、初始化 DB、注册 IPC；--smoke-test / --smoke-ui
-│   ├── preload.ts               # contextBridge 暴露 window.api（全部 IPC 通道）
-│   ├── db.ts                    # SQLite 连接、建表、默认设置（含财务密码哈希）
-│   ├── schedule.ts              # 排课生成算法（date-fns，weekday 1=周一…7=周日）
-│   ├── ipcHandlers.ts           # 全部 IPC 处理器与业务逻辑（财务权限校验）
-│   ├── excelExport.ts           # exceljs 工作簿构建（与保存对话框解耦，便于测试）
-│   └── smoke.ts                 # 冒烟测试（逻辑 + UI，走真实 preload/IPC 链路）
-├── src/                         # 渲染进程（React）
-│   ├── App.tsx                  # 应用外壳：顶部导航 + 财务密码门 + 页面路由
-│   ├── api.ts                   # window.api 封装、错误信息提取（getErrorMessage/tryApi）
-│   ├── types.ts                 # 全项目共享类型（主/渲染进程共用，不依赖 DOM）
-│   ├── global.d.ts              # window.api 类型声明
-│   ├── components/              # PageToolbar、ExportExcelButton、AttendanceStatusTag、
-│   │                            # InstanceDetailModal（考勤/调课）、CourseManagerModal（课程管理）
-│   └── pages/                   # CalendarPage（月/周/日视图）、StudentsPage、TeachersPage、
-│                                # FinanceDashboard、CourseFeesPage、StudentPaymentsPage、
-│                                # TeacherPaymentsPage、ReportsPage、SettingsPage
-├── scripts/rebuild-native.js    # postinstall：将 better-sqlite3 编译为 Electron 原生模块（支持镜像）
-├── electron.vite.config.ts      # 三段构建入口配置（入口必须用绝对路径，见下）
-├── electron-builder.yml         # 打包配置（asarUnpack better-sqlite3，npmRebuild）
-├── docs/images/                 # 说明书截图（由 --smoke-ui + VLEARN_SHOT_DIR 生成）
-└── index.html                   # 渲染进程 HTML（含 CSP）
+├── electron/                    # Electron 主进程
+│   ├── main.ts                  # 入口：初始化三库+认证、注册 IPC；--smoke-test / --smoke-ui
+│   ├── db.ts                    # 三库管理（vlearn_academic/finance/assistant.db）、旧库自动迁移
+│   ├── auth.ts                  # 角色会话（登录/登出/密码），auth.json 持久化，requireRole 权限校验
+│   ├── ai.ts                    # OpenAI 兼容大模型客户端（30s 超时、错误归一化）
+│   ├── agent.ts                 # 教务/财务 Agent 逻辑（本地规则检测 + 可选 LLM 文本生成）
+│   ├── schedule.ts              # 排课生成算法
+│   ├── ipcHandlers.ts           # 全部 IPC 处理器（每个通道严格角色校验 + 跨库只读/清理）
+│   ├── excelExport.ts           # exceljs 工作簿构建
+│   ├── preload.ts               # contextBridge 暴露 window.api
+│   └── smoke.ts                 # 冒烟测试（逻辑 + UI）
+├── src/                         # 渲染进程
+│   ├── App.tsx                  # 外壳：登录门 + 角色菜单（Sider）+ 右侧 Agent 助手面板
+│   ├── roleContext.ts           # useRole() 当前角色上下文
+│   ├── api.ts / types.ts / global.d.ts
+│   ├── pages/                   # LoginPage、CalendarPage、Students/TeachersPage、
+│   │                            # ReportsCenterPage（教务报告）、SettingsPage（按角色分节）、
+│   │                            # FinanceDashboard、CourseFees、Student/TeacherPayments、Reports、
+│   │                            # LessonNotesPage、HistoryMessagesPage（助教）
+│   └── components/              # AgentSidebar、LessonNoteEditorModal、InstanceDetailModal、
+│                                # CourseManagerModal、PageToolbar、ExportExcelButton 等
+├── scripts/rebuild-native.js    # postinstall：better-sqlite3 → Electron ABI（支持镜像）
+└── .github/workflows/           # 云端构建（GitHub Actions：Windows + macOS 安装包）
 ```
 
 ## 环境要求与快速开始
 
-- Node.js ≥ 20（开发时使用 24 验证通过）
-- npm（或 pnpm）
-- 编译 better-sqlite3 需要 C++ 工具链：macOS 安装 Xcode Command Line Tools（`xcode-select --install`）；Windows 安装 Visual Studio Build Tools（勾选 C++ 生成工具）与 Python 3
-
 ```bash
 npm install        # 安装依赖，postinstall 自动将 better-sqlite3 rebuild 为 Electron ABI
 npm run dev        # 开发模式（Vite HMR + Electron）
-npm run smoke      # 逻辑冒烟测试（临时数据库，走真实 IPC 链路，不污染用户数据）
-npm run smoke:ui   # UI 冒烟测试（验证 React 挂载、无渲染错误，可选截图）
-npm run build      # 构建 out/（main + preload + renderer）
-npm run dist       # 打包当前平台安装包（输出 release/）
-npm run dist:mac   # 打包 macOS（dmg）
-npm run dist:win   # 打包 Windows（nsis；Windows 安装包建议在 Windows 机器上构建）
+npm run smoke      # 逻辑冒烟测试（临时数据目录，走真实 IPC 链路）
+npm run smoke:ui   # UI 冒烟测试（登录页/三角色界面渲染；VLEARN_SHOT_DIR=dir 可截图）
+npm run typecheck  # 主进程 + 渲染进程类型检查
+npm run build      # 构建 out/
+npm run dist       # 打包当前平台安装包（release/）
 ```
 
-> **国内网络**：`.npmrc` 已配置 `electron_mirror`（npmmirror），`scripts/rebuild-native.js` 会自动把镜像注入 `ELECTRON_MIRROR`。若在其他网络环境，删除 `.npmrc` 中的镜像配置即可。`electron-builder` 打包下载 AppImage/NSIS 等二进制同理走 `electron_builder_binaries_mirror`。
+- Node.js ≥ 20（20/22/24 均验证可用）；编译 better-sqlite3 需要 C++ 工具链（macOS：Xcode CLT；Windows：VS Build Tools + Python，或直接双击根目录 `build-windows.bat` 一键构建）。
+- **国内网络**：`.npmrc` 已配 npmmirror 镜像，postinstall 自动注入 `ELECTRON_MIRROR`。
+- **云端构建**：推送到 GitHub 后，Actions → “构建安装包（Windows + macOS）” → Run workflow，产物在 Artifacts（30 天有效）。
 
 ## 架构说明
+
+### 角色与物理数据隔离
+
+| | 教务 academic | 财务 finance | 助教 assistant |
+| --- | --- | --- | --- |
+| 数据库文件 | `vlearn_academic.db` | `vlearn_finance.db` | `vlearn_assistant.db` |
+| 初始密码 | `admin123` | `admin123` | `assistant123` |
+| 教务数据（课程/学生/老师/考勤） | 读/写 | 只读 | 只读 |
+| 课程费用（fee/pay_per_session 两列） | 不可见（IPC 边界清零） | 读/写 | 不可见 |
+| 财务数据（缴费/课酬/报表） | 不可见 | 读/写 | 不可见 |
+| 助教数据（课程记录/短信） | 不可见 | 不可见 | 读/写 |
+
+- 登录：应用启动显示角色选择页 → 密码验证（SHA-256 存各自库 `settings.password_hash`）→ 会话持久化到 `auth.json`，下次启动自动进入，直至"退出登录"。
+- 主进程每个 IPC 处理器首行 `requireRole([...])` 校验会话角色；财务/助教对教务库的访问只经过**只读 SQL**；跨库外键（如财务库的 `course_id`）无法在 SQLite 声明，由主进程在教务删除课程/学生/老师时**同步清理**财务库关联记录。
+- 旧版单库升级：首次启动检测 `vlearn.db` → 按域复制到三个新库（行数校验）→ 财务密码沿用旧哈希，教务/助教写入初始密码 → 旧库重命名备份（`vlearn.db.migrated-*`）并写 `migration.log`；失败时保留旧库并在登录页提示，新库清空后下次重试。
 
 ### 进程模型与数据流
 
 ```
-┌─────────────────────── 主进程 (electron/) ───────────────────────┐
-│  initDb() → better-sqlite3（userData/vlearn.db）                 │
-│  registerIpcHandlers()：ipcMain.handle 注册全部通道              │
-│  财务会话标记 financeUnlocked：仅 verifyPassword 可置位          │
-└───────────────▲──────────────────────────────────────────────────┘
+┌──────────────────────── 主进程 (electron/) ────────────────────────┐
+│  initDatabases()：三库连接 + 建表 + 种子设置 + 旧库迁移            │
+│  initAuth()：会话（auth.json）→ requireRole() 统一权限闸门        │
+│  Agent：本地规则（冲突/考勤/对账/逾期/异常）+ callLLM 文本生成      │
+└───────────────▲────────────────────────────────────────────────────┘
                 │ contextBridge / ipcRenderer.invoke
-┌───────────────┴─────────── 渲染进程 (src/) ──────────────────────┐
-│  window.api（preload 暴露，见 src/types.ts 的 VlearnApi）        │
-│  React 页面 → api.ts 封装 → 表单/表格/日历 → ExportExcelButton   │
-└──────────────────────────────────────────────────────────────────┘
+┌───────────────┴──────────── 渲染进程 (src/) ───────────────────────┐
+│  LoginPage → 角色主界面（Sider 菜单 + 内容区 + AgentSidebar）       │
+│  页面通过 window.api 调用；useRole() 感知角色条件渲染               │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-- 渲染进程**没有 Node 能力**（`contextIsolation: true`、`nodeIntegration: false`），一切数据读写必须经 `window.api`。
-- 所有数据库操作在主进程同步执行（better-sqlite3 是同步 API），IPC 用 `ipcRenderer.invoke`。
-- 恢复备份会 `closeDb() → 覆盖文件 → initDb()` 重建连接，因此**所有处理器内部通过 `getDb()` 动态取连接**，切勿在注册时闭包捕获连接（见 `ipcHandlers.ts` 顶部注释）。
+### IPC 通道清单（v2）
 
-### IPC 通道清单
-
-通道名与 `VlearnApi`（`src/types.ts`）一一对应，preload 中 `channel → invoke` 为机械映射：
-
-| 分组 | 通道 |
-| --- | --- |
-| 课程 | `courses:getAll` `courses:create` `courses:update` `courses:delete` `courses:regenerate` |
-| 老师 | `teachers:getAll` `teachers:getDetail` `teachers:create` `teachers:update` `teachers:delete` |
-| 学生 | `students:getAll` `students:getDetail` `students:create` `students:update` `students:delete` |
-| 排课 | `instances:getRange` `instances:getDetail` `instances:update` `instances:cancel` `instances:restore` |
-| 考勤 | `attendance:save` `attendance:remove` `attendance:markAllPresent` |
-| 财务会话 | `finance:verifyPassword` `finance:logout` `finance:changePassword` |
-| 财务业务 | `finance:getDashboard` `finance:getCourses` `finance:updateCourseFees` `finance:getStudentPayments` `finance:createStudentPayment` `finance:updateStudentPayment` `finance:deleteStudentPayment` `finance:autoCalcStudentPayments` `finance:getTeacherPayments` `finance:createTeacherPayment` `finance:updateTeacherPayment` `finance:deleteTeacherPayment` `finance:autoCalcTeacherPayments` `finance:getPaymentInstances` `finance:getMonthlyReport` |
-| 设置/备份 | `settings:get` `settings:save` `backup:create` `backup:restore` |
-| 导出 | `export:excel` |
-
-### 权限模型（双重控制）
-
-- **前端**：财务页面（仪表盘/课程费用/学生缴费/老师课酬/盈亏报表）只有通过密码弹窗验证后才能进入；教务页面不渲染任何费用字段（课程费用、课酬、缴费均不出现，而非置灰）。
-- **主进程**：所有 `finance:*` 处理器首行调用 `ensureFinance()`，未验证直接抛错 `无权访问财务数据，请先输入财务密码`。会话标记仅存于主进程内存，重启应用即失效。
-- 财务密码 SHA-256 哈希存于 `settings` 表 `finance_password_hash`（初始 `admin123`）；修改密码需验证旧密码（设置页）。
-
-### 数据库
-
-表结构见 `electron/db.ts` 的 `migrate()`，与需求文档一致，两处增强：
-
-- `courses.pay_per_session`：单次课酬标准（用于"自动计算应付"），默认 0。
-- 两处外键声明为 `ON DELETE SET NULL`（`courses.default_teacher_id`、`schedule_instances.actual_teacher_id`），避免删除老师时因外键约束失败；删除课程/学生仍级联删除（CASCADE）。
-
-`settings` 表键值：
-
-| key | 含义 | 默认值 |
+| 分组 | 通道 | 权限 |
 | --- | --- | --- |
-| `grades` | 年级选项 JSON 数组 | `["高一","高二","高三"]` |
-| `payment_methods` | 缴费方式 JSON 数组 | `["微信","转账","现金"]` |
-| `finance_password_hash` | 财务密码 SHA-256 | `sha256("admin123")` |
-| `schedule_weeks` | 自动排课周数 | `8` |
-| `charge_absent` | 缺勤是否收费 | `1`（收费） |
+| 登录 | `auth:getStatus` `auth:login` `auth:logout` `auth:changePassword` | 登录无需会话，改密需会话 |
+| 教务读 | `courses:getAll` `teachers:getAll` `teachers:getDetail` `students:getAll` `students:getDetail` `instances:getRange` `instances:getDetail` | 三角色 |
+| 教务写 | `courses:create/update/delete/regenerate` `teachers:create/update/delete` `students:create/update/delete` `instances:update/cancel/restore` `attendance:save/remove/markAllPresent` | 仅教务 |
+| 财务 | `finance:getDashboard` `finance:getCourses` `finance:updateCourseFees` `finance:getStudentPayments` `finance:createStudentPayment` `finance:updateStudentPayment` `finance:deleteStudentPayment` `finance:autoCalcStudentPayments` `finance:getTeacherPayments` `finance:createTeacherPayment` `finance:updateTeacherPayment` `finance:deleteTeacherPayment` `finance:autoCalcTeacherPayments` `finance:getPaymentInstances` `finance:getMonthlyReport` | 仅财务 |
+| 助教 | `assistant:getLessonNote` `assistant:saveLessonNote` `assistant:listLessonNotes` `assistant:generateSms` `assistant:listMessages` `assistant:deleteMessage` | 仅助教 |
+| Agent | `agent:getAlerts`（教务/财务）`agent:checkCourseConflict` `agent:checkInstanceConflict` `agent:suggestSlots` `agent:checkDuplicateName` `agent:generateReport`（教务）`agent:reconcile` `agent:checkPaymentAnomaly` `agent:trendAnalysis` `agent:smartReport`（财务） | 按角色 |
+| 设置/备份/导出 | `settings:get` `settings:save`（按角色分节）`app:getVersion` `backup:create` `backup:restore` `export:excel` | 任意已登录角色 |
 
-数据库文件位置：`app.getPath('userData')/vlearn.db`（macOS 为 `~/Library/Application Support/vlearn/vlearn.db`，Windows 为 `%APPDATA%/vlearn/vlearn.db`）。
+### Agent 设计原则
 
-### 业务规则实现
+- **检测类能力全部本地确定性规则**（离线可用、毫秒级）：排课冲突（老师/学生时间重叠）、考勤异常（连续缺勤/请假 ≥ 阈值）、信息补全、相似姓名、对账差异、缴费逾期、异常交易（金额超均值 N 倍 / 频繁修改 / 实缴远大于应缴）。
+- **文本生成类能力优先大模型、未配置时回退系统模板**：微信群短信（未配置则报错，助教必配）、教务周报/月报、盈亏趋势分析、智能报表（`GeneratedContent.usedAi` 标记来源）。模型名/温度/提示词由开发者预设（`electron/ai.ts`），用户仅填 API URL + Key（OpenAI 兼容，如 `https://api.deepseek.com/v1`）。
+- 侧边栏提醒由渲染进程触发刷新（登录后 / 每 4 小时 / 页面动作派发 `vlearn:refresh-alerts` 事件），计算在主进程。
 
-- **自动排课**（`electron/schedule.ts`）：课程创建时按 `default_schedule_rule`（JSON：`[{weekday, start, end}]`，weekday 1=周一…7=周日）生成未来 N 周实例，同日期+时间段去重；`courses:regenerate` 删除今天及未来的实例后按当前规则重建（历史保留）。修改课程规则**不会**自动改动已生成实例（界面有"重新生成排课"按钮）。
-- **学生应缴**（`finance:autoCalcStudentPayments`）：应缴 = 课程费用 × 计费出勤次数（出勤必计费，请假不收费，缺勤按 `charge_absent` 设置）；每个（学生,课程）维护一条记录，重复执行只更新 `amount_due`，不动 `amount_paid`。
-- **老师应付**（`finance:autoCalcTeacherPayments`）：为每个未取消实例生成/更新一条课酬记录，应付 = 课程 `pay_per_session`；实例有代课老师（`actual_teacher_id`）时支付给代课老师。
-- **盈亏**：收入 = 学生缴费 `amount_paid` 合计；支出 = 老师课酬 `amount_paid` 合计；月度统计按记录的 `payment_date` 所在月份（仪表盘右上角有口径说明）。
+### 业务规则
 
-### 导出与备份
+- **排课**：课程创建按 `default_schedule_rule` 自动生成未来 N 周实例；修改规则不自动更新已有实例，可"重新生成排课"（仅重建今天及未来，历史保留）。
+- **应缴** = 课程费用 × 计费出勤次数（出勤必计费、请假免费、缺勤按财务设置 `charge_absent`）；**应付** = 单次课酬标准（代课付给代课老师）。
+- **盈亏** = 学生实缴 − 老师实付，按月统计（`payment_date` 所在月份）。
 
-- `export:excel` 是通用导出通道：渲染进程把**当前筛选后的行**与列定义传给主进程，主进程弹保存对话框并用 exceljs 写 `.xlsx`，文件名 `Vlearn_{模块名}_{yyyy-MM-dd}.xlsx`。`buildWorkbook`（`electron/excelExport.ts`）与对话框解耦，可直接单测。
-- 备份：`better-sqlite3` 的在线备份 API（`db.backup(dest)`），无需停库；恢复：校验文件含 `students` 表 → 关连接 → 覆盖 → 重开 → `webContents.reload()`。
+### 各角色库 `settings` 表关键键
+
+- 通用：`password_hash`；教务：`grades` `schedule_weeks` `agent_conflict_detect` `agent_attendance_alert` `agent_attendance_threshold` `agent_completeness_hint` `ai_api_url` `ai_api_key`；财务：`payment_methods` `charge_absent` `agent_overdue_alert` `agent_overdue_days` `agent_anomaly_detect` `agent_anomaly_multiplier` `ai_api_url` `ai_api_key`；助教：`ai_api_url` `ai_api_key`。
+- `ai_model` 可被技术人员直接写入各库覆盖默认模型名（界面不开放）。
 
 ## 开发约定
 
-### 新增一个 IPC 接口的步骤
+新增 IPC 接口：`src/types.ts`（VlearnApi 签名）→ `electron/ipcHandlers.ts`（处理器，首行 requireRole）→ `electron/preload.ts`（通道映射）。行字段 camelCase（SQL 别名或 `mapXxx()` 映射）；错误用中文 `Error` 抛出、渲染层 `getErrorMessage()` 展示；日期 `YYYY-MM-DD` 字符串；金额两位小数。
 
-1. `src/types.ts`：在 `VlearnApi` 中声明方法签名（参数用驼峰命名）。
-2. `electron/ipcHandlers.ts`：在对应分组的 `register*Handlers()` 中 `ipcMain.handle('通道名', ...)`；财务类接口首行 `ensureFinance()`。
-3. `electron/preload.ts`：补一行 `通道名: (参数) => ipcRenderer.invoke('通道名', 参数)`。
-4. `src/api.ts` 无需改动（`api = window.api` 直接透传）。
-
-### 其他约定
-
-- 行字段一律 camelCase；SQL 用别名（`class_name AS className`）或 `mapXxx()` 行映射器转换（见 `ipcHandlers.ts`）。
-- 错误处理：主进程抛中文 `Error`；渲染进程用 `getErrorMessage(err)` 剥掉 Electron 包装前缀再展示；表单提交用 `tryApi()`。
-- 日期一律 `YYYY-MM-DD` 字符串；金额两位小数（`Math.round(x*100)/100`）。
-- 类型检查：`npm run typecheck`（node/web 两个 tsconfig 分开，`src/types.ts` 被两者共享，因此它不能依赖 DOM/React 类型）。
-- **electron.vite.config.ts 的入口必须用绝对路径**：相对路径 `electron/main.ts` 会被 `externalizeDepsPlugin` 按依赖名 `electron` 误判为外部模块导致构建失败。
+**electron.vite.config.ts 的入口必须用绝对路径**（相对路径 `electron/main.ts` 会被 externalizeDepsPlugin 误判为依赖名 `electron`）。
 
 ## 测试
 
 ```bash
-npm run smoke      # 41 项断言：默认设置、排课（8 周/周几正确性）、考勤、调课/取消/恢复、
-                   # 财务权限拦截、自动计算应缴/应付、仪表盘、报表、密码修改、重新排课、
-                   # Excel 生成、设置保存、级联删除
-npm run smoke:ui   # React 挂载、导航渲染、preload 注入、无渲染进程错误
-                   # 设 VLEARN_SHOT_DIR=<dir> 可同时抓取各页面截图（用于文档）
+npm run smoke      # 迁移验证 + 三角色登录/越权拦截 + 教务/财务/助教全流程 + Agent 能力（约 60 项断言）
+npm run smoke:ui   # 登录页渲染、三个角色登录后主界面渲染、无渲染进程错误
 ```
 
-冒烟测试使用 `mkdtemp` 临时数据库，不触碰用户数据；通过隐藏 BrowserWindow 加载真实 preload 后 `executeJavaScript` 调用 `window.api`，覆盖完整 IPC 链路。
+冒烟测试使用 `mkdtemp` 临时目录（含独立迁移测试），不触碰用户数据；经隐藏 BrowserWindow 加载真实 preload 后 `executeJavaScript` 调用 `window.api`，覆盖完整 IPC 链路。
 
 ## 打包分发
 
-- 打包配置见 `electron-builder.yml`：`asarUnpack` 解包 better-sqlite3（`.node` 必须落在 asar 外），`npmRebuild: true` 保证安装包内的原生模块匹配 Electron ABI。
-- macOS 输出 dmg（未签名，首次打开需右键 → 打开，或自行配置签名）；Windows 输出 nsis 安装包（支持选择安装目录）。
-- 跨平台构建注意：nsis 在 macOS 上构建需要 wine；正式分发建议分别在对应系统上构建。
-- 升级注意事项：`userData/vlearn.db` 独立于安装包，覆盖安装不会丢失数据；大版本升级前建议用"设置 → 备份数据"导出数据库。
+- `electron-builder.yml`：`publish: null`（CI 中不自动发布）、`asarUnpack` better-sqlite3、`npmRebuild: true`。
+- macOS 输出 dmg（未签名，首次打开需右键 → 打开）；Windows 输出 nsis 安装包。
+- Windows 安装包可在任意 Windows 电脑上双击 `build-windows.bat` 一键构建，或走 GitHub Actions 云端构建；详细分发流程见 [分发说明.md](./分发说明.md)。
+- 升级注意事项：覆盖安装不触碰 `userData` 下的数据库文件；v1 → v2 首次启动自动迁移（旧库保留备份）。
 
 ## 安全说明
 
-- 渲染进程无 Node 能力、上下文隔离开启；`index.html` 带 CSP（`script-src 'self' 'unsafe-inline'` 是为了兼容 Vite 开发模式注入的内联脚本，生产可收紧为 `'self'`）。
-- 财务密码以 SHA-256 存于本地 `settings` 表；这是单机应用的访问控制手段，**不适用于多用户对抗场景**，请勿在共享机器上存放大额资金数据。
-- 忘记财务密码的恢复方式：备份数据库后，由技术人员删除 `settings` 表中 `finance_password_hash` 一行并重启应用，密码即恢复为初始 `admin123`（见使用说明书 FAQ）。
+- 渲染进程无 Node 能力、上下文隔离开启；`index.html` 带 CSP。
+- 三角色密码 SHA-256 存各自数据库；会话持久化为本地 `auth.json` 标记文件——这是**单机应用的访问控制**（配合三库物理隔离），不适用于多用户对抗场景。
+- 大模型 API Key 以明文存于本地数据库（本地单机应用限制），请勿在共享机器上使用个人付费密钥。
+- 忘记角色密码：备份后由技术人员删除对应库 `settings.password_hash` 一行并重启，密码恢复为初始值（教务/财务 `admin123`、助教 `assistant123`）。
 
 ## 常见问题
 
 | 问题 | 处理 |
 | --- | --- |
-| `npm install` 时 Electron 下载超时 | `.npmrc` 已配 npmmirror 镜像；其他网络可删除镜像配置 |
-| `node-gyp failed to rebuild better-sqlite3` | 安装 C++ 工具链（macOS: `xcode-select --install`；Windows: VS Build Tools + Python）；或手动 `npm run rebuild` |
-| 开发模式白屏、控制台 CSP 报错 | 确认 `npm run dev` 由 electron-vite 启动（会注入 `ELECTRON_RENDERER_URL`） |
-| 打包后打开提示"应用已损坏"（macOS） | 未签名所致：右键 → 打开，或配置 Apple 开发者签名 |
-| 数据在哪里 | `userData/vlearn.db`（路径见上文）；备份/恢复在"设置 → 数据备份与恢复" |
-| 如何重置财务密码 | 见"安全说明"最后一条；普通用户可见 [使用说明书.md](./使用说明书.md) |
+| Electron/better-sqlite3 下载或编译失败 | `.npmrc` 已配镜像；C++ 工具链缺失时按平台安装后 `npm run rebuild` |
+| v1 升级后旧数据在哪 | 自动迁移进三个新库；旧库备份为 `userData/vlearn.db.migrated-*` |
+| 忘记角色密码 | 见"安全说明"最后一条 |
+| 助教"生成微信群短信"报错 | 未配置 API 或网络不通：助教设置 → 大模型 API 配置 |
+| 报告显示"系统模板" | 未配置大模型 API 时的正常回退，配置后自动变为 AI 润色 |

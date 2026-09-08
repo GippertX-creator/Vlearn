@@ -13,6 +13,7 @@ import { api, getErrorMessage } from '../api'
 import CourseManagerModal from '../components/CourseManagerModal'
 import InstanceDetailModal from '../components/InstanceDetailModal'
 import PageToolbar from '../components/PageToolbar'
+import { useRole } from '../roleContext'
 import type { ScheduleInstance } from '../types'
 
 type ViewMode = 'month' | 'week' | 'day'
@@ -33,6 +34,7 @@ function teacherName(inst: ScheduleInstance): string {
 }
 
 export default function CalendarPage(): JSX.Element {
+  const role = useRole()
   const [view, setView] = useState<ViewMode>('month')
   const [cursor, setCursor] = useState<Dayjs>(() => dayjs())
   const [instances, setInstances] = useState<ScheduleInstance[]>([])
@@ -230,9 +232,11 @@ export default function CalendarPage(): JSX.Element {
         title="课程日历"
         actions={
           <Space>
-            <Button icon={<BookOutlined />} onClick={() => setCourseManagerOpen(true)}>
-              课程管理
-            </Button>
+            {role === 'academic' && (
+              <Button icon={<BookOutlined />} onClick={() => setCourseManagerOpen(true)}>
+                课程管理
+              </Button>
+            )}
             <Segmented
               value={view}
               onChange={(v) => setView(v as ViewMode)}

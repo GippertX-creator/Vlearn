@@ -1,14 +1,16 @@
 /**
- * Electron 主进程入口：
- * - 创建主窗口（渲染进程 + preload）
- * - 初始化 SQLite 数据库并注册全部 IPC 处理器
- * - 支持 --smoke-test 参数：无窗口运行核心业务逻辑自检后退出
+ * Electron 主进程入口（v2）：
+ * - 初始化三个角色数据库（教务/财务/助教），旧版单库自动迁移
+ * - 初始化角色登录会话（持久化于 auth.json）
+ * - 注册全部 IPC 处理器（每个通道均做角色权限校验）
+ * - 支持 --smoke-test / --smoke-ui 无窗口自检模式
  */
 import { app, BrowserWindow, shell } from 'electron'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { initDb } from './db'
+import { initAuth } from './auth'
+import { initDatabases } from './db'
 import { registerIpcHandlers } from './ipcHandlers'
 import { runSmokeTest, runUiSmokeTest } from './smoke'
 
@@ -40,7 +42,6 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
-  // 开发模式加载 Vite Dev Server，生产模式加载打包后的静态文件
   if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
@@ -49,16 +50,20 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // 冒烟测试模式使用临时数据目录，不污染用户数据
+  let smokeDir: string | undefined
   if (isSmokeTest || isUiSmokeTest) {
-    // 冒烟测试模式：使用临时数据库，不污染用户数据
-    initDb(join(mkdtempSync(join(tmpdir(), 'vlearn-smoke-')), 'smoke.db'))
+    smokeDir = mkdtempSync(join(tmpdir(), 'vlearn-smoke-'))
+    initDatabases(smokeDir)
+    initAuth(smokeDir)
   } else {
-    initDb()
+    initDatabases()
+    initAuth(app.getPath('userData'))
   }
   registerIpcHandlers()
 
   if (isSmokeTest || isUiSmokeTest) {
-    const test = isSmokeTest ? runSmokeTest : runUiSmokeTest
+    const test = isSmokeTest ? () => runSmokeTest(smokeDir!) : runUiSmokeTest
     test()
       .then(() => app.exit(0))
       .catch((err) => {

@@ -1,7 +1,31 @@
 /**
- * 全项目共享的 TypeScript 类型定义。
+ * 全项目共享的 TypeScript 类型定义（v2：三角色架构）。
  * 本文件不依赖 DOM / React / Electron，可被主进程（electron/）与渲染进程（src/）同时引用。
  */
+
+// ---------------------------------------------------------------------------
+// 角色与登录
+// ---------------------------------------------------------------------------
+
+/** 角色：教务 / 财务 / 助教（各自独立数据库） */
+export type Role = 'academic' | 'finance' | 'assistant'
+
+/** 登录状态查询结果（渲染进程启动时判断是否跳过角色选择页） */
+export interface AuthStatus {
+  loggedIn: boolean
+  role: Role | null
+  /** 旧库数据迁移失败时返回错误信息（登录页展示，不进入系统） */
+  migrationError: string | null
+}
+
+export interface LoginResult {
+  success: boolean
+  error?: string
+}
+
+// ---------------------------------------------------------------------------
+// 考勤与排课（沿用 v1）
+// ---------------------------------------------------------------------------
 
 /** 考勤状态：出勤 / 请假 / 缺勤 */
 export type AttendanceStatus = 'present' | 'leave' | 'absent'
@@ -24,11 +48,10 @@ export interface Course {
   className: string
   defaultTeacherId: number | null
   defaultTeacherName?: string | null
-  /** 默认上课时间规则（JSON 数组字符串序列化而来，主进程返回时已解析） */
   scheduleRule: ScheduleRule[]
-  /** 课程费用（仅财务可见/可编辑） */
+  /** 课程费用（仅财务角色可见/可编辑） */
   fee: number
-  /** 单次课酬标准（仅财务可见/可编辑） */
+  /** 单次课酬标准（仅财务角色可见/可编辑） */
   payPerSession: number
   createdAt: string
   updatedAt: string
@@ -39,18 +62,14 @@ export interface Teacher {
   id: number
   name: string
   note: string | null
-  /** 所教课程 id 列表 */
   courseIds: number[]
-  /** 所教课程文本标签，如 "数学 高一 A1班" */
   courseLabels: string[]
 }
 
 /** 老师详情（含授课统计） */
 export interface TeacherDetail {
   teacher: Teacher
-  /** 累计授课次数（含代课） */
   totalInstances: number
-  /** 未来待上课程实例数 */
   upcomingInstances: number
 }
 
@@ -60,9 +79,7 @@ export interface Student {
   name: string
   schoolClass: string | null
   note: string | null
-  /** 所报课程 id 列表 */
   courseIds: number[]
-  /** 所报课程文本标签 */
   courseLabels: string[]
 }
 
@@ -85,26 +102,21 @@ export interface StudentAttendanceRecord {
 export interface StudentDetail {
   student: Student
   attendances: StudentAttendanceRecord[]
-  stats: {
-    present: number
-    leave: number
-    absent: number
-  }
+  stats: { present: number; leave: number; absent: number }
 }
 
 /** 课程实例（排课生成的单次课） */
 export interface ScheduleInstance {
   id: number
   courseId: number
-  date: string // YYYY-MM-DD
-  startTime: string // HH:MM
-  endTime: string // HH:MM
+  date: string
+  startTime: string
+  endTime: string
   /** 实际授课老师（代课场景），null 表示使用课程默认老师 */
   actualTeacherId: number | null
   actualTeacherName?: string | null
   status: InstanceStatus
   note: string | null
-  // 以下为联表冗余字段，便于日历展示
   subject?: string
   grade?: string
   className?: string
@@ -115,7 +127,6 @@ export interface ScheduleInstance {
 export interface InstanceDetail {
   instance: ScheduleInstance
   course: Course
-  /** 报名该课程的学生名单（含各自考勤状态，null 表示未标记） */
   students: {
     id: number
     name: string
@@ -124,7 +135,10 @@ export interface InstanceDetail {
   }[]
 }
 
-/** 学生缴费记录 */
+// ---------------------------------------------------------------------------
+// 财务（沿用 v1）
+// ---------------------------------------------------------------------------
+
 export interface StudentPayment {
   id: number
   studentId: number
@@ -138,7 +152,6 @@ export interface StudentPayment {
   courseLabel?: string
 }
 
-/** 老师课酬支付记录 */
 export interface TeacherPayment {
   id: number
   teacherId: number
@@ -151,49 +164,179 @@ export interface TeacherPayment {
   instanceLabel?: string
 }
 
-/** 财务仪表盘汇总数据 */
 export interface DashboardData {
-  /** 本月学生应缴总额 */
   studentDue: number
-  /** 本月学生实缴总额 */
   studentPaid: number
-  /** 本月老师应付总额 */
   teacherDue: number
-  /** 本月老师实付总额 */
   teacherPaid: number
-  /** 本月盈亏 = 实缴 - 实付 */
   profit: number
 }
 
-/** 月度盈亏报表行 */
 export interface MonthReportRow {
-  month: string // YYYY-MM
+  month: string
   income: number
   expense: number
   profit: number
 }
 
-/** 系统设置（渲染进程可见部分，不含财务密码） */
-export interface AppSettings {
-  /** 年级选项 */
-  grades: string[]
-  /** 缴费方式选项 */
-  paymentMethods: string[]
-  /** 自动排课周数 */
-  scheduleWeeks: number
-  /** 缺勤是否收费（true = 缺勤与出勤同样收费） */
-  chargeAbsent: boolean
+// ---------------------------------------------------------------------------
+// 助教模块
+// ---------------------------------------------------------------------------
+
+/** 课程内容记录 */
+export interface LessonNote {
+  id: number
+  scheduleInstanceId: number
+  knowledgePoints: string | null
+  classPerformance: string | null
+  homework: string | null
+  summary: string | null
+  /** 预留作业批改字段（未开发） */
+  homeworkGrading: string
+  createdAt: string
+  updatedAt: string
+  // 联表冗余（来自教务库课程实例，只读）
+  date?: string
+  startTime?: string
+  endTime?: string
+  subject?: string
+  grade?: string
+  className?: string
+  teacherName?: string | null
 }
 
-/** 通用 Excel 导出参数 */
+/** 生成的微信群短信缓存 */
+export interface GeneratedMessage {
+  id: number
+  lessonNoteId: number
+  messageContent: string
+  generatedAt: string
+  instanceLabel?: string
+}
+
+// ---------------------------------------------------------------------------
+// Agent（教务 / 财务智能助手）
+// ---------------------------------------------------------------------------
+
+export type AlertType = 'warning' | 'info' | 'suggestion'
+
+/** 侧边栏通知条目 */
+export interface AgentAlert {
+  id: string
+  type: AlertType
+  title: string
+  detail: string
+  createdAt: string
+}
+
+/** 排课冲突项 */
+export interface ConflictItem {
+  type: 'teacher' | 'student'
+  /** 冲突对象（老师/学生姓名） */
+  who: string
+  /** 冲突的课程标签 */
+  courseLabel: string
+  date: string
+  startTime: string
+  endTime: string
+  reason: string
+}
+
+/** 调课替补时间段建议 */
+export interface SlotSuggestion {
+  date: string
+  startTime: string
+  endTime: string
+}
+
+/** 对账差异项 */
+export interface ReconcileItem {
+  kind: 'student' | 'teacher'
+  name: string
+  courseLabel: string
+  due: number
+  paid: number
+  /** 差额（paid - due，负数表示欠款） */
+  diff: number
+  date: string
+  note: string | null
+}
+
+/** 对账检查结果 */
+export interface ReconcileResult {
+  items: ReconcileItem[]
+  studentCount: number
+  teacherCount: number
+  /** 差额合计（实付/实缴 - 应付/应缴） */
+  totalDiff: number
+  summary: string
+}
+
+/** 异常交易检测结果 */
+export interface AnomalyCheckResult {
+  anomalies: { level: 'warning'; message: string }[]
+}
+
+/** 大模型/模板生成的文本内容（usedAi 标记是否真实调用大模型） */
+export interface GeneratedContent {
+  content: string
+  usedAi: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 各角色设置
+// ---------------------------------------------------------------------------
+
+export interface AcademicSettings {
+  role: 'academic'
+  grades: string[]
+  scheduleWeeks: number
+  /** 排课冲突检测开关 */
+  agentConflictDetect: boolean
+  /** 考勤异常提醒开关 */
+  agentAttendanceAlert: boolean
+  /** 连续缺勤/请假提醒阈值（次） */
+  agentAttendanceThreshold: number
+  /** 信息补全提示开关 */
+  agentCompletenessHint: boolean
+  apiUrl: string
+  apiKey: string
+}
+
+export interface FinanceSettings {
+  role: 'finance'
+  paymentMethods: string[]
+  chargeAbsent: boolean
+  /** 缴费逾期预警开关 */
+  agentOverdueAlert: boolean
+  /** 逾期预警提前天数 */
+  agentOverdueDays: number
+  /** 异常交易检测开关 */
+  agentAnomalyDetect: boolean
+  /** 异常金额倍数阈值 */
+  agentAnomalyMultiplier: number
+  apiUrl: string
+  apiKey: string
+}
+
+export interface AssistantSettings {
+  role: 'assistant'
+  apiUrl: string
+  apiKey: string
+}
+
+export type RoleSettings = AcademicSettings | FinanceSettings | AssistantSettings
+
+// ---------------------------------------------------------------------------
+// 导出与备份
+// ---------------------------------------------------------------------------
+
 export interface ExcelExportPayload {
-  /** 模块名，用于文件名：Vlearn_{模块名}_{日期}.xlsx */
   module: string
   columns: { header: string; key: string }[]
   rows: Record<string, unknown>[]
 }
 
-/** 备份/恢复操作结果 */
 export interface BackupResult {
   success: boolean
   canceled?: boolean
@@ -201,10 +344,28 @@ export interface BackupResult {
   error?: string
 }
 
-/** preload 暴露的 window.api 完整接口（渲染进程唯一的数据通道） */
+// ---------------------------------------------------------------------------
+// window.api 完整接口（preload 暴露，渲染进程唯一数据通道）
+// ---------------------------------------------------------------------------
+
 export interface VlearnApi {
-  // ---------- 课程 ----------
+  // ---------- 登录与会话 ----------
+  getAuthStatus(): Promise<AuthStatus>
+  login(role: Role, password: string): Promise<LoginResult>
+  logout(): Promise<void>
+  /** 修改当前角色密码（验证旧密码） */
+  changePassword(oldPassword: string, newPassword: string): Promise<{ success: boolean; error?: string }>
+
+  // ---------- 教务只读（教务/财务/助教均可） ----------
   getCourses(): Promise<Course[]>
+  getTeachers(): Promise<Teacher[]>
+  getTeacherDetail(id: number): Promise<TeacherDetail>
+  getStudents(): Promise<Student[]>
+  getStudentDetail(id: number): Promise<StudentDetail>
+  getInstances(start: string, end: string): Promise<ScheduleInstance[]>
+  getInstanceDetail(id: number): Promise<InstanceDetail>
+
+  // ---------- 教务读写（仅教务） ----------
   createCourse(data: {
     subject: string
     grade: string
@@ -223,22 +384,10 @@ export interface VlearnApi {
     }
   ): Promise<Course>
   deleteCourse(id: number): Promise<void>
-  /** 删除未来课程实例并按当前规则重新生成，返回生成数量 */
   regenerateInstances(courseId: number): Promise<number>
-
-  // ---------- 老师 ----------
-  getTeachers(): Promise<Teacher[]>
-  getTeacherDetail(id: number): Promise<TeacherDetail>
   createTeacher(data: { name: string; note: string | null; courseIds: number[] }): Promise<Teacher>
-  updateTeacher(
-    id: number,
-    data: { name: string; note: string | null; courseIds: number[] }
-  ): Promise<Teacher>
+  updateTeacher(id: number, data: { name: string; note: string | null; courseIds: number[] }): Promise<Teacher>
   deleteTeacher(id: number): Promise<void>
-
-  // ---------- 学生 ----------
-  getStudents(): Promise<Student[]>
-  getStudentDetail(id: number): Promise<StudentDetail>
   createStudent(data: {
     name: string
     schoolClass: string | null
@@ -250,10 +399,6 @@ export interface VlearnApi {
     data: { name: string; schoolClass: string | null; note: string | null; courseIds: number[] }
   ): Promise<Student>
   deleteStudent(id: number): Promise<void>
-
-  // ---------- 课程实例（排课） ----------
-  getInstances(start: string, end: string): Promise<ScheduleInstance[]>
-  getInstanceDetail(id: number): Promise<InstanceDetail>
   updateInstance(
     id: number,
     data: {
@@ -266,8 +411,6 @@ export interface VlearnApi {
   ): Promise<ScheduleInstance>
   cancelInstance(id: number): Promise<void>
   restoreInstance(id: number): Promise<void>
-
-  // ---------- 考勤 ----------
   saveAttendance(data: {
     scheduleInstanceId: number
     studentId: number
@@ -275,16 +418,9 @@ export interface VlearnApi {
     note?: string | null
   }): Promise<void>
   removeAttendance(data: { scheduleInstanceId: number; studentId: number }): Promise<void>
-  /** 一键将该课程实例所有报名学生标记为出勤，返回标记人数 */
   markAllPresent(scheduleInstanceId: number): Promise<number>
 
-  // ---------- 财务（以下所有方法在主进程校验财务会话） ----------
-  verifyFinancePassword(password: string): Promise<boolean>
-  logoutFinance(): Promise<void>
-  changeFinancePassword(oldPassword: string, newPassword: string): Promise<{
-    success: boolean
-    error?: string
-  }>
+  // ---------- 财务（仅财务角色） ----------
   getDashboard(month: string): Promise<DashboardData>
   getFinanceCourses(): Promise<Course[]>
   updateCourseFees(id: number, data: { fee: number; payPerSession: number }): Promise<Course>
@@ -311,7 +447,6 @@ export interface VlearnApi {
     }
   ): Promise<void>
   deleteStudentPayment(id: number): Promise<void>
-  /** 根据考勤自动计算学生应缴金额，返回处理的（学生,课程）组合数 */
   autoCalcStudentPayments(): Promise<number>
   getTeacherPayments(): Promise<TeacherPayment[]>
   createTeacherPayment(data: {
@@ -334,21 +469,67 @@ export interface VlearnApi {
     }
   ): Promise<void>
   deleteTeacherPayment(id: number): Promise<void>
-  /** 根据课程实例自动生成/更新老师课酬记录，返回处理数量 */
   autoCalcTeacherPayments(): Promise<number>
-  /** 按年份查询月度盈亏报表（含"合计"行，month 为 '合计'） */
   getMonthlyReport(year: number): Promise<MonthReportRow[]>
-  /** 供课酬表单选择课程实例（含单次课酬标准），仅财务可用 */
   getPaymentInstances(): Promise<ScheduleInstance[]>
 
-  // ---------- 设置 ----------
-  getSettings(): Promise<AppSettings>
-  saveSettings(data: AppSettings): Promise<void>
-  /** 应用版本号（读取自 package.json，用于"关于"页展示，便于确认用户安装的版本） */
+  // ---------- 助教（仅助教角色） ----------
+  getLessonNote(scheduleInstanceId: number): Promise<LessonNote | null>
+  saveLessonNote(data: {
+    scheduleInstanceId: number
+    knowledgePoints: string | null
+    classPerformance: string | null
+    homework: string | null
+    summary: string | null
+  }): Promise<LessonNote>
+  listLessonNotes(): Promise<LessonNote[]>
+  /** 生成微信群短信（调用外部大模型，失败抛错；成功后自动存入历史） */
+  generateSms(lessonNoteId: number): Promise<{ content: string }>
+  listMessages(): Promise<GeneratedMessage[]>
+  deleteMessage(id: number): Promise<void>
+
+  // ---------- Agent（按当前角色提供对应能力） ----------
+  /** 侧边栏主动提醒（教务：考勤异常/信息补全；财务：缴费逾期） */
+  getAlerts(): Promise<AgentAlert[]>
+  /** 排课冲突检测（新增/编辑课程时，教务） */
+  checkCourseConflict(data: {
+    courseId: number | null
+    defaultTeacherId: number | null
+    scheduleRule: ScheduleRule[]
+  }): Promise<ConflictItem[]>
+  /** 单次调课冲突检测（教务） */
+  checkInstanceConflict(data: {
+    instanceId: number
+    date: string
+    startTime: string
+    endTime: string
+    actualTeacherId: number | null
+  }): Promise<ConflictItem[]>
+  /** 调课替补时间段建议（教务，返回 3 个） */
+  suggestSlots(instanceId: number): Promise<SlotSuggestion[]>
+  /** 新增学生/老师时相似姓名检测（教务） */
+  checkDuplicateName(kind: 'student' | 'teacher', name: string): Promise<{ matches: string[] }>
+  /** 生成周报/月报（教务，已配大模型时由 AI 润色） */
+  generateReport(kind: 'week' | 'month'): Promise<GeneratedContent>
+  /** 对账检查（财务，按钮触发，本地规则） */
+  reconcile(): Promise<ReconcileResult>
+  /** 缴费/支付记录异常检测（财务，新增/修改时触发） */
+  checkPaymentAnomaly(data: {
+    kind: 'student' | 'teacher'
+    id?: number
+    amountPaid: number
+    amountDue: number
+  }): Promise<AnomalyCheckResult>
+  /** 盈亏趋势分析（财务） */
+  trendAnalysis(): Promise<GeneratedContent>
+  /** 智能报表/凭证生成（财务，基于当前筛选结果） */
+  smartReport(module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]): Promise<GeneratedContent>
+
+  // ---------- 设置 / 备份 / 导出 ----------
+  getSettings(): Promise<RoleSettings>
+  saveSettings(data: RoleSettings): Promise<void>
   getAppVersion(): Promise<string>
   backupData(): Promise<BackupResult>
   restoreData(): Promise<BackupResult>
-
-  // ---------- Excel 导出 ----------
   exportExcel(payload: ExcelExportPayload): Promise<{ success: boolean; canceled?: boolean; path?: string }>
 }

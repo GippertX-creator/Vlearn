@@ -4,6 +4,8 @@
  * - "自动计算应缴"：根据考勤批量生成 / 更新每个学生每门课的应缴金额（实缴不变）
  * - 按学生、课程筛选；底部合计行展示应缴合计与实缴合计
  * - 新增 / 编辑弹窗：选择学生后限定其报名课程，选择课程后自动带出课程费用
+ * - 保存前异常交易检测：调用 checkPaymentAnomaly（本地规则），存在异常时弹窗确认是否仍然保存
+ * - 缴费方式选项来自财务角色设置（RoleSettings 收窄后取值），未加载时用默认值兜底
  */
 import {
   CalculatorOutlined,
@@ -32,7 +34,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, getErrorMessage, tryApi } from '../api'
 import ExportExcelButton from '../components/ExportExcelButton'
 import PageToolbar from '../components/PageToolbar'
-import type { AppSettings, Course, Student, StudentPayment } from '../types'
+import type { Course, RoleSettings, Student, StudentPayment } from '../types'
 
 /** 新增/编辑弹窗表单值（日期在表单中为 Dayjs，提交时转 YYYY-MM-DD） */
 interface PaymentFormValues {
@@ -59,7 +61,8 @@ export default function StudentPaymentsPage(): JSX.Element {
   const [payments, setPayments] = useState<StudentPayment[]>([])
   const [students, setStudents] = useState<Student[]>([])
   const [courses, setCourses] = useState<Course[]>([])
-  const [settings, setSettings] = useState<AppSettings | null>(null)
+  /** 当前角色设置（财务角色返回 FinanceSettings，按 role 收窄后读取缴费方式） */
+  const [settings, setSettings] = useState<RoleSettings | null>(null)
   const [loading, setLoading] = useState(false)
   /** 筛选条件（undefined 表示不筛选） */
   const [studentFilter, setStudentFilter] = useState<number | undefined>()
@@ -99,7 +102,9 @@ export default function StudentPaymentsPage(): JSX.Element {
   const studentById = useMemo(() => new Map(students.map((s) => [s.id, s])), [students])
   /** 当前表单选中的学生（用于限定其报名课程） */
   const selectedStudentId = (Form.useWatch('studentId', form) ?? undefined) as number | undefined
-  const paymentMethods = settings?.paymentMethods ?? DEFAULT_PAYMENT_METHODS
+  /** 缴费方式选项：设置加载完成且角色为财务时取自定义选项，否则用默认值兜底 */
+  const paymentMethods =
+    settings?.role === 'finance' ? settings.paymentMethods : DEFAULT_PAYMENT_METHODS
 
   /** 按学生 / 课程客户端过滤（与导出内容一致） */
   const filtered = useMemo(
@@ -151,6 +156,42 @@ export default function StudentPaymentsPage(): JSX.Element {
     if (fee !== undefined) form.setFieldsValue({ amountDue: fee })
   }
 
+  /**
+   * 保存前异常交易检测：后台按财务设置的异常倍数等本地规则校验；
+   * 存在异常时弹窗二次确认，"仍然保存"放行、"返回检查"取消本次保存。
+   */
+  const confirmSaveIfAnomaly = async (amountDue: number, amountPaid: number): Promise<void> => {
+    const check = await tryApi(() =>
+      api.checkPaymentAnomaly({
+        kind: 'student',
+        id: editing === 'new' ? undefined : (editing as StudentPayment).id,
+        amountPaid,
+        amountDue
+      })
+    )
+    if (!check.ok) throw new Error(check.error)
+    if (check.data.anomalies.length > 0) {
+      await new Promise<void>((resolve, reject) => {
+        Modal.confirm({
+          title: '异常交易提醒',
+          width: 560,
+          content: (
+            <div>
+              {check.data.anomalies.map((a) => (
+                <p key={a.message}>⚠️ {a.message}</p>
+              ))}
+              <p>是否仍然保存？</p>
+            </div>
+          ),
+          okText: '仍然保存',
+          cancelText: '返回检查',
+          onOk: () => resolve(),
+          onCancel: () => reject(new Error('已取消保存'))
+        })
+      })
+    }
+  }
+
   const handleSave = async (): Promise<void> => {
     let values: PaymentFormValues
     try {
@@ -169,19 +210,22 @@ export default function StudentPaymentsPage(): JSX.Element {
       note: values.note?.trim() || null
     }
     setSaving(true)
-    const res =
-      editing === 'new'
-        ? await tryApi(() => api.createStudentPayment(payload))
-        : await tryApi(() => api.updateStudentPayment((editing as StudentPayment).id, payload))
-    if (!res.ok) {
-      message.error(res.error)
+    try {
+      // 保存前异常检测（通过则继续，异常时用户确认后放行）
+      await confirmSaveIfAnomaly(values.amountDue, values.amountPaid)
+      const res =
+        editing === 'new'
+          ? await tryApi(() => api.createStudentPayment(payload))
+          : await tryApi(() => api.updateStudentPayment((editing as StudentPayment).id, payload))
+      if (!res.ok) throw new Error(res.error)
+      message.success(editing === 'new' ? '缴费记录已添加' : '缴费记录已保存')
+      setEditing(null)
+      await load()
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
       setSaving(false)
-      return
     }
-    message.success(editing === 'new' ? '缴费记录已添加' : '缴费记录已保存')
-    setEditing(null)
-    setSaving(false)
-    await load()
   }
 
   const handleDelete = async (p: StudentPayment): Promise<void> => {

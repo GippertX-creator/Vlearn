@@ -1,26 +1,47 @@
 /**
- * IPC 处理器：渲染进程通过 window.api（preload 暴露）调用此处注册的方法，
- * 所有数据库读写均在此完成。
+ * IPC 处理器（v2：三角色物理隔离架构）。
  *
- * 权限模型：
- * - 教务操作（课程/老师/学生/排课/考勤）无需验证，应用启动即教务端；
- * - 财务相关 IPC 均先经过 ensureFinance() 校验主进程内的财务会话标记，
- *   该标记仅能通过 finance:verifyPassword 校验密码后置位。
+ * 权限模型（主进程强制，渲染进程无法绕过）：
+ * - 教务写（课程/老师/学生/排课/考勤变更）        → 仅 academic
+ * - 教务读（课程/老师/学生/排课/考勤查询）        → academic / finance / assistant（后两者只读）
+ * - 财务全部通道                                → 仅 finance（可读写教务库中课程的 fee/pay_per_session 两列）
+ * - 助教全部通道                                → 仅 assistant（lesson_notes / generated_messages 存于助教库）
+ * - 登录/登出/状态、备份恢复、Excel 导出          → 任意已登录角色
+ *
+ * 跨库规则：
+ * - 财务计算学生应缴/老师应付时经只读 SQL 查询教务库（students/courses/schedule_instances/attendances），
+ *   财务库中的外键引用（student_id/course_id/…）无法声明跨库约束，由本文件在
+ *   教务删除课程/学生/老师时同步清理财务库关联记录。
+ * - 非财务角色获取课程数据时，fee/pay_per_session 字段在 IPC 边界被清零（完全不可见）。
  */
 import { app, BrowserWindow, dialog, ipcMain } from 'electron'
 import Database from 'better-sqlite3'
 import fs from 'node:fs'
 import { format } from 'date-fns'
 import type {
-  AppSettings,
+  AcademicSettings,
+  AgentAlert,
+  AnomalyCheckResult,
+  AssistantSettings,
   AttendanceStatus,
+  AuthStatus,
+  ConflictItem,
   Course,
   DashboardData,
   ExcelExportPayload,
+  FinanceSettings,
+  GeneratedContent,
+  GeneratedMessage,
   InstanceDetail,
+  LessonNote,
+  LoginResult,
   MonthReportRow,
+  ReconcileResult,
+  Role,
+  RoleSettings,
   ScheduleInstance,
   ScheduleRule,
+  SlotSuggestion,
   Student,
   StudentDetail,
   StudentPayment,
@@ -28,20 +49,32 @@ import type {
   TeacherDetail,
   TeacherPayment
 } from '../src/types'
-import { getDb, getDbPath, getSetting, initDb, closeDb, setSetting, sha256 } from './db'
+import {
+  checkCourseConflict,
+  checkDuplicateName,
+  checkInstanceConflict,
+  checkPaymentAnomaly,
+  generateReport,
+  getAcademicAlerts,
+  getFinanceAlerts,
+  reconcile,
+  smartReport,
+  suggestSlots,
+  trendAnalysis
+} from './agent'
+import { callLLM } from './ai'
+import { changePassword, login, logout, requireRole, roleLabel } from './auth'
+import { closeAll, getDb, getDbPath, getMigrationError, getSettingValue, initDatabases, setSettingValue } from './db'
 import { buildWorkbook, exportFileName } from './excelExport'
 import { generateInstances } from './schedule'
 
-/** 财务会话标记：应用启动为 false，密码验证通过后为 true */
-let financeUnlocked = false
-
-/** 校验财务权限，未解锁时抛出异常 */
-function ensureFinance(): void {
-  if (!financeUnlocked) throw new Error('无权访问财务数据，请先输入财务密码')
+/** 教务读权限：三角色均可 */
+function guardAcademicRead(): void {
+  requireRole(['academic', 'finance', 'assistant'])
 }
 
 // ---------------------------------------------------------------------------
-// 行映射工具：SQL 列名（snake_case）→ 前端字段（camelCase）
+// 行映射工具（snake_case → camelCase；非财务角色屏蔽费用字段）
 // ---------------------------------------------------------------------------
 
 interface CourseRow {
@@ -58,7 +91,7 @@ interface CourseRow {
   updated_at: string
 }
 
-function mapCourse(row: CourseRow): Course {
+function mapCourse(row: CourseRow, maskFee: boolean): Course {
   let scheduleRule: ScheduleRule[] = []
   try {
     scheduleRule = JSON.parse(row.default_schedule_rule ?? '[]') as ScheduleRule[]
@@ -73,16 +106,12 @@ function mapCourse(row: CourseRow): Course {
     defaultTeacherId: row.default_teacher_id,
     defaultTeacherName: row.default_teacher_name,
     scheduleRule,
-    fee: row.fee,
-    payPerSession: row.pay_per_session,
+    // 费用字段仅财务可见：其他角色在 IPC 边界清零
+    fee: maskFee ? 0 : row.fee,
+    payPerSession: maskFee ? 0 : row.pay_per_session,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   }
-}
-
-/** 课程标签，如 "数学 高一 A1班" */
-export function courseLabel(subject: string, grade: string, className: string): string {
-  return `${subject} ${grade} ${className}`
 }
 
 const COURSE_SELECT = `
@@ -91,14 +120,18 @@ const COURSE_SELECT = `
   LEFT JOIN teachers t ON t.id = c.default_teacher_id
 `
 
-function fetchCourse(id: number): Course | null {
-  const row = getDb().prepare(`${COURSE_SELECT} WHERE c.id = ?`).get(id) as CourseRow | undefined
-  return row ? mapCourse(row) : null
+function fetchCourse(id: number, maskFee = false): Course | null {
+  const row = getDb('academic').prepare(`${COURSE_SELECT} WHERE c.id = ?`).get(id) as CourseRow | undefined
+  return row ? mapCourse(row, maskFee) : null
 }
 
-/** 读取课程的关联 id 列表 */
+/** 课程标签，如 "数学 高一 A1班" */
+export function courseLabel(subject: string, grade: string, className: string): string {
+  return `${subject} ${grade} ${className}`
+}
+
 function relationIds(table: 'teacher_courses' | 'student_courses', ownerCol: string, ownerId: number): number[] {
-  const rows = getDb().prepare(`SELECT course_id FROM ${table} WHERE ${ownerCol} = ? ORDER BY course_id`).all(ownerId) as {
+  const rows = getDb('academic').prepare(`SELECT course_id FROM ${table} WHERE ${ownerCol} = ? ORDER BY course_id`).all(ownerId) as {
     course_id: number
   }[]
   return rows.map((r) => r.course_id)
@@ -107,39 +140,112 @@ function relationIds(table: 'teacher_courses' | 'student_courses', ownerCol: str
 function courseLabelsByIds(ids: number[]): string[] {
   if (ids.length === 0) return []
   const placeholders = ids.map(() => '?').join(',')
-  const rows = getDb()
+  const rows = getDb('academic')
     .prepare(`SELECT subject, grade, class_name FROM courses WHERE id IN (${placeholders}) ORDER BY id`)
     .all(...ids) as { subject: string; grade: string; class_name: string }[]
   return rows.map((r) => courseLabel(r.subject, r.grade, r.class_name))
 }
 
+interface InstanceRow {
+  id: number
+  course_id: number
+  date: string
+  start_time: string
+  end_time: string
+  actual_teacher_id: number | null
+  status: 'normal' | 'adjusted' | 'cancelled'
+  note: string | null
+  subject: string
+  grade: string
+  class_name: string
+  default_teacher_name: string | null
+  actual_teacher_name: string | null
+}
+
+function mapInstance(row: InstanceRow): ScheduleInstance {
+  return {
+    id: row.id,
+    courseId: row.course_id,
+    date: row.date,
+    startTime: row.start_time,
+    endTime: row.end_time,
+    actualTeacherId: row.actual_teacher_id,
+    actualTeacherName: row.actual_teacher_name,
+    status: row.status,
+    note: row.note,
+    subject: row.subject,
+    grade: row.grade,
+    className: row.class_name,
+    defaultTeacherName: row.default_teacher_name
+  }
+}
+
 // ---------------------------------------------------------------------------
-// 课程
+// 登录与角色设置
+// ---------------------------------------------------------------------------
+
+function registerAuthHandlers(): void {
+  ipcMain.handle('auth:getStatus', (): AuthStatus => {
+    const role = requireRoleSafe()
+    return { loggedIn: role !== null, role, migrationError: getMigrationError() }
+  })
+
+  ipcMain.handle('auth:login', (_e, role: Role, password: string): LoginResult => {
+    if (!['academic', 'finance', 'assistant'].includes(role)) return { success: false, error: '无效的角色' }
+    return login(role, password)
+  })
+
+  ipcMain.handle('auth:logout', (): void => {
+    logout()
+  })
+
+  ipcMain.handle('auth:changePassword', (_e, oldPassword: string, newPassword: string): { success: boolean; error?: string } => {
+    requireRole(['academic', 'finance', 'assistant'])
+    return changePassword(oldPassword, newPassword)
+  })
+}
+
+/** 未登录返回 null（不抛错，供 auth:getStatus 使用） */
+function requireRoleSafe(): Role | null {
+  try {
+    return requireRole(['academic', 'finance', 'assistant'])
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 课程（写：教务；读：三角色）
 // ---------------------------------------------------------------------------
 
 function registerCourseHandlers(): void {
   ipcMain.handle('courses:getAll', (): Course[] => {
-    const rows = getDb().prepare(`${COURSE_SELECT} ORDER BY c.id`).all() as CourseRow[]
-    return rows.map(mapCourse)
+    guardAcademicRead()
+    const role = requireRole(['academic', 'finance', 'assistant'])
+    const rows = getDb('academic').prepare(`${COURSE_SELECT} ORDER BY c.id`).all() as CourseRow[]
+    return rows.map((r) => mapCourse(r, role !== 'finance'))
   })
 
   ipcMain.handle(
     'courses:create',
-    (_e, data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }): Course => {
+    (
+      _e,
+      data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }
+    ): Course => {
+      requireRole(['academic'])
       const subject = String(data.subject ?? '').trim()
       const grade = String(data.grade ?? '').trim()
       const className = String(data.className ?? '').trim()
       if (!subject || !grade || !className) throw new Error('科目、年级、班级号不能为空')
-      const result = getDb()
+      const result = getDb('academic')
         .prepare(
           `INSERT INTO courses (subject, grade, class_name, default_teacher_id, default_schedule_rule)
            VALUES (?, ?, ?, ?, ?)`
         )
         .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []))
       const courseId = Number(result.lastInsertRowid)
-      // 创建课程后自动生成未来 N 周课程实例
-      const weeks = parseInt(getSetting('schedule_weeks') ?? '8', 10) || 8
-      generateInstances(getDb(),courseId, data.scheduleRule ?? [], new Date(), weeks)
+      const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
+      generateInstances(getDb('academic'), courseId, data.scheduleRule ?? [], new Date(), weeks)
       return fetchCourse(courseId)!
     }
   )
@@ -151,62 +257,83 @@ function registerCourseHandlers(): void {
       id: number,
       data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }
     ): Course => {
-      const course = fetchCourse(id)
-      if (!course) throw new Error('课程不存在')
+      requireRole(['academic'])
+      if (!fetchCourse(id)) throw new Error('课程不存在')
       const subject = String(data.subject ?? '').trim()
       const grade = String(data.grade ?? '').trim()
       const className = String(data.className ?? '').trim()
       if (!subject || !grade || !className) throw new Error('科目、年级、班级号不能为空')
-      // 仅更新基础信息；已生成的课程实例不自动变化，需手动"重新生成排课"
-      getDb().prepare(
-        `UPDATE courses SET subject = ?, grade = ?, class_name = ?, default_teacher_id = ?, default_schedule_rule = ?,
-         updated_at = datetime('now') WHERE id = ?`
-      ).run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), id)
+      getDb('academic')
+        .prepare(
+          `UPDATE courses SET subject = ?, grade = ?, class_name = ?, default_teacher_id = ?, default_schedule_rule = ?,
+           updated_at = datetime('now') WHERE id = ?`
+        )
+        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), id)
       return fetchCourse(id)!
     }
   )
 
   ipcMain.handle('courses:delete', (_e, id: number): void => {
-    // 级联删除课程实例、考勤、缴费/课酬记录（外键 ON DELETE CASCADE）
-    getDb().prepare('DELETE FROM courses WHERE id = ?').run(id)
+    requireRole(['academic'])
+    // 跨库清理：财务库中与该课程相关的外键引用（外键无法跨库声明）
+    const instanceIds = (getDb('academic').prepare('SELECT id FROM schedule_instances WHERE course_id = ?').all(id) as { id: number }[])
+      .map((r) => r.id)
+    const tx = getDb('academic').transaction(() => {
+      if (instanceIds.length > 0) {
+        const placeholders = instanceIds.map(() => '?').join(',')
+        getDb('finance').prepare(`DELETE FROM teacher_payments WHERE schedule_instance_id IN (${placeholders})`).run(...instanceIds)
+      }
+      getDb('finance').prepare('DELETE FROM student_payments WHERE course_id = ?').run(id)
+      getDb('academic').prepare('DELETE FROM courses WHERE id = ?').run(id)
+    })
+    tx()
   })
 
   ipcMain.handle('courses:regenerate', (_e, courseId: number): number => {
+    requireRole(['academic'])
     const course = fetchCourse(courseId)
     if (!course) throw new Error('课程不存在')
-    // 删除今天及未来的实例，保留历史（过去）实例，再按当前规则重新生成
     const today = format(new Date(), 'yyyy-MM-dd')
-    getDb().prepare('DELETE FROM schedule_instances WHERE course_id = ? AND date >= ?').run(courseId, today)
-    const weeks = parseInt(getSetting('schedule_weeks') ?? '8', 10) || 8
-    return generateInstances(getDb(),courseId, course.scheduleRule, new Date(), weeks)
+    // 收集将被删除的实例，先清理财务库课酬记录
+    const deletedIds = (
+      getDb('academic').prepare('SELECT id FROM schedule_instances WHERE course_id = ? AND date >= ?').all(courseId, today) as {
+        id: number
+      }[]
+    ).map((r) => r.id)
+    const tx = getDb('academic').transaction(() => {
+      if (deletedIds.length > 0) {
+        const placeholders = deletedIds.map(() => '?').join(',')
+        getDb('finance').prepare(`DELETE FROM teacher_payments WHERE schedule_instance_id IN (${placeholders})`).run(...deletedIds)
+      }
+      getDb('academic').prepare('DELETE FROM schedule_instances WHERE course_id = ? AND date >= ?').run(courseId, today)
+    })
+    tx()
+    const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
+    return generateInstances(getDb('academic'), courseId, course.scheduleRule, new Date(), weeks)
   })
 }
 
 // ---------------------------------------------------------------------------
-// 老师
+// 老师（写：教务；读：三角色）
 // ---------------------------------------------------------------------------
 
 function registerTeacherHandlers(): void {
   ipcMain.handle('teachers:getAll', (): Teacher[] => {
-    const rows = getDb().prepare('SELECT * FROM teachers ORDER BY id').all() as {
+    guardAcademicRead()
+    const rows = getDb('academic').prepare('SELECT * FROM teachers ORDER BY id').all() as {
       id: number
       name: string
       note: string | null
     }[]
     return rows.map((row) => {
       const courseIds = relationIds('teacher_courses', 'teacher_id', row.id)
-      return {
-        id: row.id,
-        name: row.name,
-        note: row.note,
-        courseIds,
-        courseLabels: courseLabelsByIds(courseIds)
-      }
+      return { id: row.id, name: row.name, note: row.note, courseIds, courseLabels: courseLabelsByIds(courseIds) }
     })
   })
 
   ipcMain.handle('teachers:getDetail', (_e, id: number): TeacherDetail => {
-    const row = getDb().prepare('SELECT * FROM teachers WHERE id = ?').get(id) as
+    guardAcademicRead()
+    const row = getDb('academic').prepare('SELECT * FROM teachers WHERE id = ?').get(id) as
       | { id: number; name: string; note: string | null }
       | undefined
     if (!row) throw new Error('老师不存在')
@@ -218,14 +345,14 @@ function registerTeacherHandlers(): void {
       courseIds,
       courseLabels: courseLabelsByIds(courseIds)
     }
-    const total = getDb()
+    const total = getDb('academic')
       .prepare(
         `SELECT COUNT(*) AS c FROM schedule_instances si
          JOIN courses c ON c.id = si.course_id
          WHERE si.actual_teacher_id = ? OR (si.actual_teacher_id IS NULL AND c.default_teacher_id = ?)`
       )
       .get(id, id) as { c: number }
-    const upcoming = getDb()
+    const upcoming = getDb('academic')
       .prepare(
         `SELECT COUNT(*) AS c FROM schedule_instances si
          JOIN courses c ON c.id = si.course_id
@@ -237,72 +364,64 @@ function registerTeacherHandlers(): void {
   })
 
   const replaceTeacherCourses = (teacherId: number, courseIds: number[]): void => {
-    const tx = getDb().transaction(() => {
-      getDb().prepare('DELETE FROM teacher_courses WHERE teacher_id = ?').run(teacherId)
-      const insert = getDb().prepare('INSERT INTO teacher_courses (teacher_id, course_id) VALUES (?, ?)')
+    const tx = getDb('academic').transaction(() => {
+      getDb('academic').prepare('DELETE FROM teacher_courses WHERE teacher_id = ?').run(teacherId)
+      const insert = getDb('academic').prepare('INSERT INTO teacher_courses (teacher_id, course_id) VALUES (?, ?)')
       for (const courseId of courseIds) insert.run(teacherId, courseId)
     })
     tx()
   }
 
-  ipcMain.handle(
-    'teachers:create',
-    (_e, data: { name: string; note: string | null; courseIds: number[] }): Teacher => {
-      const name = String(data.name ?? '').trim()
-      if (!name) throw new Error('老师姓名不能为空')
-      const result = getDb().prepare('INSERT INTO teachers (name, note) VALUES (?, ?)').run(name, data.note ?? null)
-      const id = Number(result.lastInsertRowid)
-      replaceTeacherCourses(id, data.courseIds ?? [])
-      const row = getDb().prepare('SELECT * FROM teachers WHERE id = ?').get(id) as {
-        id: number
-        name: string
-        note: string | null
-      }
-      return {
-        id: row.id,
-        name: row.name,
-        note: row.note,
-        courseIds: data.courseIds ?? [],
-        courseLabels: courseLabelsByIds(data.courseIds ?? [])
-      }
+  ipcMain.handle('teachers:create', (_e, data: { name: string; note: string | null; courseIds: number[] }): Teacher => {
+    requireRole(['academic'])
+    const name = String(data.name ?? '').trim()
+    if (!name) throw new Error('老师姓名不能为空')
+    const result = getDb('academic').prepare('INSERT INTO teachers (name, note) VALUES (?, ?)').run(name, data.note ?? null)
+    const id = Number(result.lastInsertRowid)
+    replaceTeacherCourses(id, data.courseIds ?? [])
+    return {
+      id,
+      name,
+      note: data.note ?? null,
+      courseIds: data.courseIds ?? [],
+      courseLabels: courseLabelsByIds(data.courseIds ?? [])
     }
-  )
+  })
 
-  ipcMain.handle(
-    'teachers:update',
-    (_e, id: number, data: { name: string; note: string | null; courseIds: number[] }): Teacher => {
-      const name = String(data.name ?? '').trim()
-      if (!name) throw new Error('老师姓名不能为空')
-      getDb().prepare('UPDATE teachers SET name = ?, note = ? WHERE id = ?').run(name, data.note ?? null, id)
-      replaceTeacherCourses(id, data.courseIds ?? [])
-      const row = getDb().prepare('SELECT * FROM teachers WHERE id = ?').get(id) as {
-        id: number
-        name: string
-        note: string | null
-      }
-      return {
-        id: row.id,
-        name: row.name,
-        note: row.note,
-        courseIds: data.courseIds ?? [],
-        courseLabels: courseLabelsByIds(data.courseIds ?? [])
-      }
+  ipcMain.handle('teachers:update', (_e, id: number, data: { name: string; note: string | null; courseIds: number[] }): Teacher => {
+    requireRole(['academic'])
+    const name = String(data.name ?? '').trim()
+    if (!name) throw new Error('老师姓名不能为空')
+    getDb('academic').prepare('UPDATE teachers SET name = ?, note = ? WHERE id = ?').run(name, data.note ?? null, id)
+    replaceTeacherCourses(id, data.courseIds ?? [])
+    return {
+      id,
+      name,
+      note: data.note ?? null,
+      courseIds: data.courseIds ?? [],
+      courseLabels: courseLabelsByIds(data.courseIds ?? [])
     }
-  )
+  })
 
   ipcMain.handle('teachers:delete', (_e, id: number): void => {
-    // 解除课程默认老师引用（课酬/考勤关联的外键为 SET NULL / CASCADE）
-    getDb().prepare('DELETE FROM teachers WHERE id = ?').run(id)
+    requireRole(['academic'])
+    // 跨库清理财务库课酬记录
+    const tx = getDb('academic').transaction(() => {
+      getDb('finance').prepare('DELETE FROM teacher_payments WHERE teacher_id = ?').run(id)
+      getDb('academic').prepare('DELETE FROM teachers WHERE id = ?').run(id)
+    })
+    tx()
   })
 }
 
 // ---------------------------------------------------------------------------
-// 学生
+// 学生（写：教务；读：三角色）
 // ---------------------------------------------------------------------------
 
 function registerStudentHandlers(): void {
   ipcMain.handle('students:getAll', (): Student[] => {
-    const rows = getDb().prepare('SELECT * FROM students ORDER BY id').all() as {
+    guardAcademicRead()
+    const rows = getDb('academic').prepare('SELECT * FROM students ORDER BY id').all() as {
       id: number
       name: string
       school_class: string | null
@@ -322,7 +441,8 @@ function registerStudentHandlers(): void {
   })
 
   ipcMain.handle('students:getDetail', (_e, id: number): StudentDetail => {
-    const row = getDb().prepare('SELECT * FROM students WHERE id = ?').get(id) as
+    guardAcademicRead()
+    const row = getDb('academic').prepare('SELECT * FROM students WHERE id = ?').get(id) as
       | { id: number; name: string; school_class: string | null; note: string | null }
       | undefined
     if (!row) throw new Error('学生不存在')
@@ -335,7 +455,7 @@ function registerStudentHandlers(): void {
       courseIds,
       courseLabels: courseLabelsByIds(courseIds)
     }
-    const attendances = getDb()
+    const attendances = getDb('academic')
       .prepare(
         `SELECT a.id, a.status, a.note, si.date, si.start_time, si.end_time, si.course_id,
                 c.subject, c.grade, c.class_name,
@@ -383,9 +503,9 @@ function registerStudentHandlers(): void {
   })
 
   const replaceStudentCourses = (studentId: number, courseIds: number[]): void => {
-    const tx = getDb().transaction(() => {
-      getDb().prepare('DELETE FROM student_courses WHERE student_id = ?').run(studentId)
-      const insert = getDb().prepare('INSERT INTO student_courses (student_id, course_id) VALUES (?, ?)')
+    const tx = getDb('academic').transaction(() => {
+      getDb('academic').prepare('DELETE FROM student_courses WHERE student_id = ?').run(studentId)
+      const insert = getDb('academic').prepare('INSERT INTO student_courses (student_id, course_id) VALUES (?, ?)')
       for (const courseId of courseIds) insert.run(studentId, courseId)
     })
     tx()
@@ -394,9 +514,10 @@ function registerStudentHandlers(): void {
   ipcMain.handle(
     'students:create',
     (_e, data: { name: string; schoolClass: string | null; note: string | null; courseIds: number[] }): Student => {
+      requireRole(['academic'])
       const name = String(data.name ?? '').trim()
       if (!name) throw new Error('学生姓名不能为空')
-      const result = getDb()
+      const result = getDb('academic')
         .prepare('INSERT INTO students (name, school_class, note) VALUES (?, ?, ?)')
         .run(name, data.schoolClass ?? null, data.note ?? null)
       const id = Number(result.lastInsertRowid)
@@ -415,14 +536,12 @@ function registerStudentHandlers(): void {
   ipcMain.handle(
     'students:update',
     (_e, id: number, data: { name: string; schoolClass: string | null; note: string | null; courseIds: number[] }): Student => {
+      requireRole(['academic'])
       const name = String(data.name ?? '').trim()
       if (!name) throw new Error('学生姓名不能为空')
-      getDb().prepare('UPDATE students SET name = ?, school_class = ?, note = ? WHERE id = ?').run(
-        name,
-        data.schoolClass ?? null,
-        data.note ?? null,
-        id
-      )
+      getDb('academic')
+        .prepare('UPDATE students SET name = ?, school_class = ?, note = ? WHERE id = ?')
+        .run(name, data.schoolClass ?? null, data.note ?? null, id)
       replaceStudentCourses(id, data.courseIds ?? [])
       return {
         id,
@@ -436,7 +555,13 @@ function registerStudentHandlers(): void {
   )
 
   ipcMain.handle('students:delete', (_e, id: number): void => {
-    getDb().prepare('DELETE FROM students WHERE id = ?').run(id)
+    requireRole(['academic'])
+    // 跨库清理财务库缴费记录
+    const tx = getDb('academic').transaction(() => {
+      getDb('finance').prepare('DELETE FROM student_payments WHERE student_id = ?').run(id)
+      getDb('academic').prepare('DELETE FROM students WHERE id = ?').run(id)
+    })
+    tx()
   })
 }
 
@@ -444,43 +569,10 @@ function registerStudentHandlers(): void {
 // 课程实例与考勤
 // ---------------------------------------------------------------------------
 
-interface InstanceRow {
-  id: number
-  course_id: number
-  date: string
-  start_time: string
-  end_time: string
-  actual_teacher_id: number | null
-  status: 'normal' | 'adjusted' | 'cancelled'
-  note: string | null
-  subject: string
-  grade: string
-  class_name: string
-  default_teacher_name: string | null
-  actual_teacher_name: string | null
-}
-
-function mapInstance(row: InstanceRow): ScheduleInstance {
-  return {
-    id: row.id,
-    courseId: row.course_id,
-    date: row.date,
-    startTime: row.start_time,
-    endTime: row.end_time,
-    actualTeacherId: row.actual_teacher_id,
-    actualTeacherName: row.actual_teacher_name,
-    status: row.status,
-    note: row.note,
-    subject: row.subject,
-    grade: row.grade,
-    className: row.class_name,
-    defaultTeacherName: row.default_teacher_name
-  }
-}
-
 function registerInstanceHandlers(): void {
   ipcMain.handle('instances:getRange', (_e, start: string, end: string): ScheduleInstance[] => {
-    const rows = getDb()
+    guardAcademicRead()
+    const rows = getDb('academic')
       .prepare(
         `SELECT si.*, c.subject, c.grade, c.class_name,
                 def.name AS default_teacher_name, act.name AS actual_teacher_name
@@ -496,7 +588,9 @@ function registerInstanceHandlers(): void {
   })
 
   ipcMain.handle('instances:getDetail', (_e, id: number): InstanceDetail => {
-    const row = getDb()
+    guardAcademicRead()
+    const role = requireRole(['academic', 'finance', 'assistant'])
+    const row = getDb('academic')
       .prepare(
         `SELECT si.*, c.subject, c.grade, c.class_name,
                 def.name AS default_teacher_name, act.name AS actual_teacher_name
@@ -508,8 +602,8 @@ function registerInstanceHandlers(): void {
       )
       .get(id) as InstanceRow | undefined
     if (!row) throw new Error('课程实例不存在')
-    const course = fetchCourse(row.course_id)!
-    const students = getDb()
+    const course = fetchCourse(row.course_id, role !== 'finance')!
+    const students = getDb('academic')
       .prepare(
         `SELECT s.id, s.name, s.school_class, a.status AS attendance_status
          FROM student_courses sc
@@ -543,13 +637,16 @@ function registerInstanceHandlers(): void {
       id: number,
       data: { date: string; startTime: string; endTime: string; actualTeacherId: number | null; note: string | null }
     ): ScheduleInstance => {
+      requireRole(['academic'])
       if (!data.date || !data.startTime || !data.endTime) throw new Error('日期与时间不能为空')
-      getDb().prepare(
-        `UPDATE schedule_instances
-         SET date = ?, start_time = ?, end_time = ?, actual_teacher_id = ?, note = ?, status = 'adjusted'
-         WHERE id = ?`
-      ).run(data.date, data.startTime, data.endTime, data.actualTeacherId ?? null, data.note ?? null, id)
-      const row = getDb()
+      getDb('academic')
+        .prepare(
+          `UPDATE schedule_instances
+           SET date = ?, start_time = ?, end_time = ?, actual_teacher_id = ?, note = ?, status = 'adjusted'
+           WHERE id = ?`
+        )
+        .run(data.date, data.startTime, data.endTime, data.actualTeacherId ?? null, data.note ?? null, id)
+      const row = getDb('academic')
         .prepare(
           `SELECT si.*, c.subject, c.grade, c.class_name,
                   def.name AS default_teacher_name, act.name AS actual_teacher_name
@@ -565,39 +662,45 @@ function registerInstanceHandlers(): void {
   )
 
   ipcMain.handle('instances:cancel', (_e, id: number): void => {
-    getDb().prepare(`UPDATE schedule_instances SET status = 'cancelled' WHERE id = ?`).run(id)
+    requireRole(['academic'])
+    getDb('academic').prepare(`UPDATE schedule_instances SET status = 'cancelled' WHERE id = ?`).run(id)
   })
 
   ipcMain.handle('instances:restore', (_e, id: number): void => {
-    getDb().prepare(`UPDATE schedule_instances SET status = 'normal' WHERE id = ?`).run(id)
+    requireRole(['academic'])
+    getDb('academic').prepare(`UPDATE schedule_instances SET status = 'normal' WHERE id = ?`).run(id)
   })
 
   ipcMain.handle(
     'attendance:save',
     (_e, data: { scheduleInstanceId: number; studentId: number; status: AttendanceStatus; note?: string | null }): void => {
+      requireRole(['academic'])
       if (!['present', 'leave', 'absent'].includes(data.status)) throw new Error('无效的考勤状态')
-      getDb().prepare(
-        `INSERT INTO attendances (schedule_instance_id, student_id, status, note)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(schedule_instance_id, student_id)
-         DO UPDATE SET status = excluded.status, note = excluded.note, created_at = datetime('now')`
-      ).run(data.scheduleInstanceId, data.studentId, data.status, data.note ?? null)
+      getDb('academic')
+        .prepare(
+          `INSERT INTO attendances (schedule_instance_id, student_id, status, note)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(schedule_instance_id, student_id)
+           DO UPDATE SET status = excluded.status, note = excluded.note, created_at = datetime('now')`
+        )
+        .run(data.scheduleInstanceId, data.studentId, data.status, data.note ?? null)
     }
   )
 
   ipcMain.handle('attendance:remove', (_e, data: { scheduleInstanceId: number; studentId: number }): void => {
-    getDb().prepare('DELETE FROM attendances WHERE schedule_instance_id = ? AND student_id = ?').run(
-      data.scheduleInstanceId,
-      data.studentId
-    )
+    requireRole(['academic'])
+    getDb('academic')
+      .prepare('DELETE FROM attendances WHERE schedule_instance_id = ? AND student_id = ?')
+      .run(data.scheduleInstanceId, data.studentId)
   })
 
   ipcMain.handle('attendance:markAllPresent', (_e, scheduleInstanceId: number): number => {
-    const instance = getDb().prepare('SELECT course_id FROM schedule_instances WHERE id = ?').get(scheduleInstanceId) as
-      | { course_id: number }
-      | undefined
+    requireRole(['academic'])
+    const instance = getDb('academic')
+      .prepare('SELECT course_id FROM schedule_instances WHERE id = ?')
+      .get(scheduleInstanceId) as { course_id: number } | undefined
     if (!instance) throw new Error('课程实例不存在')
-    const result = getDb()
+    const result = getDb('academic')
       .prepare(
         `INSERT INTO attendances (schedule_instance_id, student_id, status)
          SELECT ?, sc.student_id, 'present' FROM student_courses sc WHERE sc.course_id = ?
@@ -609,101 +712,50 @@ function registerInstanceHandlers(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 财务：密码与会话
-// ---------------------------------------------------------------------------
-
-function registerFinanceSessionHandlers(): void {
-  ipcMain.handle('finance:verifyPassword', (_e, password: string): boolean => {
-    const hash = getSetting('finance_password_hash')
-    if (hash && sha256(String(password ?? '')) === hash) {
-      financeUnlocked = true
-      return true
-    }
-    return false
-  })
-
-  ipcMain.handle('finance:logout', (): void => {
-    financeUnlocked = false
-  })
-
-  ipcMain.handle(
-    'finance:changePassword',
-    (_e, oldPassword: string, newPassword: string): { success: boolean; error?: string } => {
-      const hash = getSetting('finance_password_hash')
-      if (hash && sha256(String(oldPassword ?? '')) !== hash) {
-        return { success: false, error: '旧密码不正确' }
-      }
-      const next = String(newPassword ?? '')
-      if (next.length < 6) return { success: false, error: '新密码长度至少 6 位' }
-      setSetting('finance_password_hash', sha256(next))
-      return { success: true }
-    }
-  )
-}
-
-// ---------------------------------------------------------------------------
-// 财务：仪表盘 / 课程费用 / 学生缴费 / 老师课酬 / 报表
+// 财务（仅 finance 角色；读教务库做只读计算）
 // ---------------------------------------------------------------------------
 
 function registerFinanceHandlers(): void {
+  const guard = (): void => {
+    requireRole(['finance'])
+  }
+
   ipcMain.handle('finance:getDashboard', (_e, month: string): DashboardData => {
-    ensureFinance()
+    guard()
     const m = String(month ?? '')
     if (!/^\d{4}-\d{2}$/.test(m)) throw new Error('月份格式应为 YYYY-MM')
     const sum = (sql: string): number => {
-      const row = getDb().prepare(sql).get(m) as { s: number } | undefined
+      const row = getDb('finance').prepare(sql).get(m) as { s: number } | undefined
       return row?.s ?? 0
     }
-    const studentDue = sum(
-      `SELECT COALESCE(SUM(amount_due), 0) AS s FROM student_payments WHERE substr(payment_date, 1, 7) = ?`
-    )
-    const studentPaid = sum(
-      `SELECT COALESCE(SUM(amount_paid), 0) AS s FROM student_payments WHERE substr(payment_date, 1, 7) = ?`
-    )
-    const teacherDue = sum(
-      `SELECT COALESCE(SUM(amount_due), 0) AS s FROM teacher_payments WHERE substr(payment_date, 1, 7) = ?`
-    )
-    const teacherPaid = sum(
-      `SELECT COALESCE(SUM(amount_paid), 0) AS s FROM teacher_payments WHERE substr(payment_date, 1, 7) = ?`
-    )
-    return {
-      studentDue,
-      studentPaid,
-      teacherDue,
-      teacherPaid,
-      profit: studentPaid - teacherPaid
-    }
+    const studentDue = sum(`SELECT COALESCE(SUM(amount_due), 0) AS s FROM student_payments WHERE substr(payment_date, 1, 7) = ?`)
+    const studentPaid = sum(`SELECT COALESCE(SUM(amount_paid), 0) AS s FROM student_payments WHERE substr(payment_date, 1, 7) = ?`)
+    const teacherDue = sum(`SELECT COALESCE(SUM(amount_due), 0) AS s FROM teacher_payments WHERE substr(payment_date, 1, 7) = ?`)
+    const teacherPaid = sum(`SELECT COALESCE(SUM(amount_paid), 0) AS s FROM teacher_payments WHERE substr(payment_date, 1, 7) = ?`)
+    return { studentDue, studentPaid, teacherDue, teacherPaid, profit: studentPaid - teacherPaid }
   })
 
   ipcMain.handle('finance:getCourses', (): Course[] => {
-    ensureFinance()
-    const rows = getDb().prepare(`${COURSE_SELECT} ORDER BY c.id`).all() as CourseRow[]
-    return rows.map(mapCourse)
+    guard()
+    const rows = getDb('academic').prepare(`${COURSE_SELECT} ORDER BY c.id`).all() as CourseRow[]
+    return rows.map((r) => mapCourse(r, false))
   })
 
-  ipcMain.handle(
-    'finance:updateCourseFees',
-    (_e, id: number, data: { fee: number; payPerSession: number }): Course => {
-      ensureFinance()
-      getDb().prepare(
-        `UPDATE courses SET fee = ?, pay_per_session = ?, updated_at = datetime('now') WHERE id = ?`
-      ).run(Number(data.fee) || 0, Number(data.payPerSession) || 0, id)
-      return fetchCourse(id)!
-    }
-  )
+  ipcMain.handle('finance:updateCourseFees', (_e, id: number, data: { fee: number; payPerSession: number }): Course => {
+    guard()
+    // 权限矩阵允许财务读写教务库课程的 fee/pay_per_session 两列（唯一例外）
+    getDb('academic')
+      .prepare(`UPDATE courses SET fee = ?, pay_per_session = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(Number(data.fee) || 0, Number(data.payPerSession) || 0, id)
+    return fetchCourse(id, false)!
+  })
 
   // ---------- 学生缴费 ----------
 
   ipcMain.handle('finance:getStudentPayments', (): StudentPayment[] => {
-    ensureFinance()
-    const rows = getDb()
-      .prepare(
-        `SELECT sp.*, s.name AS student_name, c.subject, c.grade, c.class_name
-         FROM student_payments sp
-         JOIN students s ON s.id = sp.student_id
-         JOIN courses c ON c.id = sp.course_id
-         ORDER BY sp.payment_date DESC, sp.id DESC`
-      )
+    guard()
+    const rows = getDb('finance')
+      .prepare('SELECT * FROM student_payments ORDER BY payment_date DESC, id DESC')
       .all() as {
       id: number
       student_id: number
@@ -713,85 +765,92 @@ function registerFinanceHandlers(): void {
       payment_method: string
       payment_date: string
       note: string | null
-      student_name: string
-      subject: string
-      grade: string
-      class_name: string
     }[]
-    return rows.map((r) => ({
-      id: r.id,
-      studentId: r.student_id,
-      courseId: r.course_id,
-      amountDue: r.amount_due,
-      amountPaid: r.amount_paid,
-      paymentMethod: r.payment_method,
-      paymentDate: r.payment_date,
-      note: r.note,
-      studentName: r.student_name,
-      courseLabel: courseLabel(r.subject, r.grade, r.class_name)
-    }))
+    return rows.map((r) => {
+      const student = getDb('academic').prepare('SELECT name FROM students WHERE id = ?').get(r.student_id) as
+        | { name: string }
+        | undefined
+      const course = getDb('academic')
+        .prepare('SELECT subject, grade, class_name FROM courses WHERE id = ?')
+        .get(r.course_id) as { subject: string; grade: string; class_name: string } | undefined
+      return {
+        id: r.id,
+        studentId: r.student_id,
+        courseId: r.course_id,
+        amountDue: r.amount_due,
+        amountPaid: r.amount_paid,
+        paymentMethod: r.payment_method,
+        paymentDate: r.payment_date,
+        note: r.note,
+        studentName: student?.name ?? `学生#${r.student_id}`,
+        courseLabel: course ? courseLabel(course.subject, course.grade, course.class_name) : `课程#${r.course_id}`
+      }
+    })
   })
 
-  ipcMain.handle(
-    'finance:createStudentPayment',
-    (
-      _e,
-      data: { studentId: number; courseId: number; amountDue: number; amountPaid: number; paymentMethod: string; paymentDate: string; note: string | null }
-    ): void => {
-      ensureFinance()
-      if (!data.studentId || !data.courseId || !data.paymentDate) throw new Error('学生、课程、缴费日期不能为空')
-      getDb().prepare(
+  const insertStudentPayment = (data: {
+    studentId: number
+    courseId: number
+    amountDue: number
+    amountPaid: number
+    paymentMethod: string
+    paymentDate: string
+    note: string | null
+  }): void => {
+    if (!data.studentId || !data.courseId || !data.paymentDate) throw new Error('学生、课程、缴费日期不能为空')
+    getDb('finance')
+      .prepare(
         `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        data.studentId,
-        data.courseId,
-        Number(data.amountDue) || 0,
-        Number(data.amountPaid) || 0,
-        data.paymentMethod || '现金',
-        data.paymentDate,
-        data.note ?? null
       )
-    }
-  )
+      .run(data.studentId, data.courseId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentMethod || '现金', data.paymentDate, data.note ?? null)
+  }
+
+  ipcMain.handle('finance:createStudentPayment', (_e, data: Parameters<typeof insertStudentPayment>[0]): void => {
+    guard()
+    insertStudentPayment(data)
+  })
 
   ipcMain.handle(
     'finance:updateStudentPayment',
     (
       _e,
       id: number,
-      data: { studentId: number; courseId: number; amountDue: number; amountPaid: number; paymentMethod: string; paymentDate: string; note: string | null }
+      data: {
+        studentId: number
+        courseId: number
+        amountDue: number
+        amountPaid: number
+        paymentMethod: string
+        paymentDate: string
+        note: string | null
+      }
     ): void => {
-      ensureFinance()
+      guard()
       if (!data.studentId || !data.courseId || !data.paymentDate) throw new Error('学生、课程、缴费日期不能为空')
-      getDb().prepare(
-        `UPDATE student_payments
-         SET student_id = ?, course_id = ?, amount_due = ?, amount_paid = ?, payment_method = ?, payment_date = ?, note = ?
-         WHERE id = ?`
-      ).run(
-        data.studentId,
-        data.courseId,
-        Number(data.amountDue) || 0,
-        Number(data.amountPaid) || 0,
-        data.paymentMethod || '现金',
-        data.paymentDate,
-        data.note ?? null,
-        id
-      )
+      getDb('finance')
+        .prepare(
+          `UPDATE student_payments
+           SET student_id = ?, course_id = ?, amount_due = ?, amount_paid = ?, payment_method = ?, payment_date = ?, note = ?,
+               edits_count = edits_count + 1
+           WHERE id = ?`
+        )
+        .run(data.studentId, data.courseId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentMethod || '现金', data.paymentDate, data.note ?? null, id)
     }
   )
 
   ipcMain.handle('finance:deleteStudentPayment', (_e, id: number): void => {
-    ensureFinance()
-    getDb().prepare('DELETE FROM student_payments WHERE id = ?').run(id)
+    guard()
+    getDb('finance').prepare('DELETE FROM student_payments WHERE id = ?').run(id)
   })
 
   ipcMain.handle('finance:autoCalcStudentPayments', (): number => {
-    ensureFinance()
-    // 应缴 = 课程费用 × 计费出勤次数（出勤 + 可选缺勤；请假不收费）
-    const chargeAbsent = (getSetting('charge_absent') ?? '1') === '1'
+    guard()
+    // 应缴 = 课程费用 × 计费出勤次数（出勤必计费、请假免费、缺勤按财务设置）
+    // 课程费用与考勤均为教务库只读数据
+    const chargeAbsent = (getSettingValue('finance', 'charge_absent') ?? '1') === '1'
     const statuses = chargeAbsent ? "('present','absent')" : "('present')"
-    const pairs = getDb()
+    const pairs = getDb('academic')
       .prepare(
         `SELECT sc.student_id, sc.course_id, COUNT(a.id) AS cnt, c.fee
          FROM student_courses sc
@@ -806,28 +865,22 @@ function registerFinanceHandlers(): void {
       )
       .all() as { student_id: number; course_id: number; cnt: number; fee: number }[]
 
-    const upsert = getDb().prepare(
+    const upsert = getDb('finance').prepare(
       `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note)
-       VALUES (?, ?, ?, 0, ?, ?, '自动计算应缴')
-       ON CONFLICT(id) DO NOTHING`
+       VALUES (?, ?, ?, 0, ?, ?, '自动计算应缴')`
     )
-    const updateDue = getDb().prepare(
-      `UPDATE student_payments SET amount_due = ? WHERE student_id = ? AND course_id = ?`
-    )
+    const updateDue = getDb('finance').prepare('UPDATE student_payments SET amount_due = ? WHERE student_id = ? AND course_id = ?')
     const today = format(new Date(), 'yyyy-MM-dd')
-    const firstMethod = (JSON.parse(getSetting('payment_methods') ?? '["现金"]') as string[])[0] ?? '现金'
-    const tx = getDb().transaction(() => {
+    const firstMethod = (JSON.parse(getSettingValue('finance', 'payment_methods') ?? '["现金"]') as string[])[0] ?? '现金'
+    const tx = getDb('finance').transaction(() => {
       let count = 0
       for (const p of pairs) {
-        const existing = getDb()
+        const existing = getDb('finance')
           .prepare('SELECT id FROM student_payments WHERE student_id = ? AND course_id = ?')
           .get(p.student_id, p.course_id) as { id: number } | undefined
         const due = Math.round(p.cnt * p.fee * 100) / 100
-        if (existing) {
-          updateDue.run(due, p.student_id, p.course_id)
-        } else {
-          upsert.run(p.student_id, p.course_id, due, firstMethod, today)
-        }
+        if (existing) updateDue.run(due, p.student_id, p.course_id)
+        else upsert.run(p.student_id, p.course_id, due, firstMethod, today)
         count++
       }
       return count
@@ -838,17 +891,9 @@ function registerFinanceHandlers(): void {
   // ---------- 老师课酬 ----------
 
   ipcMain.handle('finance:getTeacherPayments', (): TeacherPayment[] => {
-    ensureFinance()
-    const rows = getDb()
-      .prepare(
-        `SELECT tp.*, t.name AS teacher_name,
-                si.date, si.start_time, si.end_time, c.subject, c.grade, c.class_name
-         FROM teacher_payments tp
-         JOIN teachers t ON t.id = tp.teacher_id
-         JOIN schedule_instances si ON si.id = tp.schedule_instance_id
-         JOIN courses c ON c.id = si.course_id
-         ORDER BY tp.payment_date DESC, tp.id DESC`
-      )
+    guard()
+    const rows = getDb('finance')
+      .prepare('SELECT * FROM teacher_payments ORDER BY payment_date DESC, id DESC')
       .all() as {
       id: number
       teacher_id: number
@@ -857,25 +902,33 @@ function registerFinanceHandlers(): void {
       amount_paid: number
       payment_date: string
       note: string | null
-      teacher_name: string
-      date: string
-      start_time: string
-      end_time: string
-      subject: string
-      grade: string
-      class_name: string
     }[]
-    return rows.map((r) => ({
-      id: r.id,
-      teacherId: r.teacher_id,
-      scheduleInstanceId: r.schedule_instance_id,
-      amountDue: r.amount_due,
-      amountPaid: r.amount_paid,
-      paymentDate: r.payment_date,
-      note: r.note,
-      teacherName: r.teacher_name,
-      instanceLabel: `${r.date} ${courseLabel(r.subject, r.grade, r.class_name)} ${r.start_time}-${r.end_time}`
-    }))
+    return rows.map((r) => {
+      const teacher = getDb('academic').prepare('SELECT name FROM teachers WHERE id = ?').get(r.teacher_id) as
+        | { name: string }
+        | undefined
+      const si = getDb('academic')
+        .prepare(
+          `SELECT si.date, si.start_time, si.end_time, c.subject, c.grade, c.class_name
+           FROM schedule_instances si JOIN courses c ON c.id = si.course_id WHERE si.id = ?`
+        )
+        .get(r.schedule_instance_id) as
+        | { date: string; start_time: string; end_time: string; subject: string; grade: string; class_name: string }
+        | undefined
+      return {
+        id: r.id,
+        teacherId: r.teacher_id,
+        scheduleInstanceId: r.schedule_instance_id,
+        amountDue: r.amount_due,
+        amountPaid: r.amount_paid,
+        paymentDate: r.payment_date,
+        note: r.note,
+        teacherName: teacher?.name ?? `老师#${r.teacher_id}`,
+        instanceLabel: si
+          ? `${si.date} ${courseLabel(si.subject, si.grade, si.class_name)} ${si.start_time}-${si.end_time}`
+          : `课次#${r.schedule_instance_id}`
+      }
+    })
   })
 
   ipcMain.handle(
@@ -884,19 +937,14 @@ function registerFinanceHandlers(): void {
       _e,
       data: { teacherId: number; scheduleInstanceId: number; amountDue: number; amountPaid: number; paymentDate: string; note: string | null }
     ): void => {
-      ensureFinance()
+      guard()
       if (!data.teacherId || !data.scheduleInstanceId || !data.paymentDate) throw new Error('老师、课程实例、支付日期不能为空')
-      getDb().prepare(
-        `INSERT INTO teacher_payments (teacher_id, schedule_instance_id, amount_due, amount_paid, payment_date, note)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(
-        data.teacherId,
-        data.scheduleInstanceId,
-        Number(data.amountDue) || 0,
-        Number(data.amountPaid) || 0,
-        data.paymentDate,
-        data.note ?? null
-      )
+      getDb('finance')
+        .prepare(
+          `INSERT INTO teacher_payments (teacher_id, schedule_instance_id, amount_due, amount_paid, payment_date, note)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(data.teacherId, data.scheduleInstanceId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentDate, data.note ?? null)
     }
   )
 
@@ -907,57 +955,41 @@ function registerFinanceHandlers(): void {
       id: number,
       data: { teacherId: number; scheduleInstanceId: number; amountDue: number; amountPaid: number; paymentDate: string; note: string | null }
     ): void => {
-      ensureFinance()
+      guard()
       if (!data.teacherId || !data.scheduleInstanceId || !data.paymentDate) throw new Error('老师、课程实例、支付日期不能为空')
-      getDb().prepare(
-        `UPDATE teacher_payments
-         SET teacher_id = ?, schedule_instance_id = ?, amount_due = ?, amount_paid = ?, payment_date = ?, note = ?
-         WHERE id = ?`
-      ).run(
-        data.teacherId,
-        data.scheduleInstanceId,
-        Number(data.amountDue) || 0,
-        Number(data.amountPaid) || 0,
-        data.paymentDate,
-        data.note ?? null,
-        id
-      )
+      getDb('finance')
+        .prepare(
+          `UPDATE teacher_payments
+           SET teacher_id = ?, schedule_instance_id = ?, amount_due = ?, amount_paid = ?, payment_date = ?, note = ?,
+               edits_count = edits_count + 1
+           WHERE id = ?`
+        )
+        .run(data.teacherId, data.scheduleInstanceId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentDate, data.note ?? null, id)
     }
   )
 
   ipcMain.handle('finance:deleteTeacherPayment', (_e, id: number): void => {
-    ensureFinance()
-    getDb().prepare('DELETE FROM teacher_payments WHERE id = ?').run(id)
+    guard()
+    getDb('finance').prepare('DELETE FROM teacher_payments WHERE id = ?').run(id)
   })
 
   ipcMain.handle('finance:autoCalcTeacherPayments', (): number => {
-    ensureFinance()
-    // 应付 = 课程单次课酬标准；代课场景支付给代课老师
-    const instances = getDb()
+    guard()
+    // 应付 = 课程单次课酬标准；代课场景支付给代课老师（教务库只读）
+    const instances = getDb('academic')
       .prepare(
         `SELECT si.id, si.date, si.actual_teacher_id, c.default_teacher_id, c.pay_per_session
-         FROM schedule_instances si
-         JOIN courses c ON c.id = si.course_id
+         FROM schedule_instances si JOIN courses c ON c.id = si.course_id
          WHERE si.status != 'cancelled'`
       )
-      .all() as {
-      id: number
-      date: string
-      actual_teacher_id: number | null
-      default_teacher_id: number | null
-      pay_per_session: number
-    }[]
-    const exists = getDb().prepare(
-      'SELECT id FROM teacher_payments WHERE teacher_id = ? AND schedule_instance_id = ?'
-    )
-    const insert = getDb().prepare(
+      .all() as { id: number; date: string; actual_teacher_id: number | null; default_teacher_id: number | null; pay_per_session: number }[]
+    const exists = getDb('finance').prepare('SELECT id FROM teacher_payments WHERE teacher_id = ? AND schedule_instance_id = ?')
+    const insert = getDb('finance').prepare(
       `INSERT INTO teacher_payments (teacher_id, schedule_instance_id, amount_due, amount_paid, payment_date, note)
        VALUES (?, ?, ?, 0, ?, '自动计算应付')`
     )
-    const update = getDb().prepare(
-      'UPDATE teacher_payments SET amount_due = ? WHERE teacher_id = ? AND schedule_instance_id = ?'
-    )
-    const tx = getDb().transaction(() => {
+    const update = getDb('finance').prepare('UPDATE teacher_payments SET amount_due = ? WHERE teacher_id = ? AND schedule_instance_id = ?')
+    const tx = getDb('finance').transaction(() => {
       let count = 0
       for (const si of instances) {
         const teacherId = si.actual_teacher_id ?? si.default_teacher_id
@@ -974,10 +1006,10 @@ function registerFinanceHandlers(): void {
   })
 
   ipcMain.handle('finance:getPaymentInstances', (): ScheduleInstance[] => {
-    ensureFinance()
-    const rows = getDb()
+    guard()
+    const rows = getDb('academic')
       .prepare(
-        `SELECT si.*, c.subject, c.grade, c.class_name, c.pay_per_session,
+        `SELECT si.*, c.subject, c.grade, c.class_name,
                 def.name AS default_teacher_name, act.name AS actual_teacher_name
          FROM schedule_instances si
          JOIN courses c ON c.id = si.course_id
@@ -991,19 +1023,13 @@ function registerFinanceHandlers(): void {
   })
 
   ipcMain.handle('finance:getMonthlyReport', (_e, year: number): MonthReportRow[] => {
-    ensureFinance()
+    guard()
     const y = String(year ?? new Date().getFullYear())
-    const incomeRows = getDb()
-      .prepare(
-        `SELECT substr(payment_date, 1, 7) AS month, COALESCE(SUM(amount_paid), 0) AS total
-         FROM student_payments WHERE substr(payment_date, 1, 4) = ? GROUP BY month`
-      )
+    const incomeRows = getDb('finance')
+      .prepare(`SELECT substr(payment_date, 1, 7) AS month, COALESCE(SUM(amount_paid), 0) AS total FROM student_payments WHERE substr(payment_date, 1, 4) = ? GROUP BY month`)
       .all(y) as { month: string; total: number }[]
-    const expenseRows = getDb()
-      .prepare(
-        `SELECT substr(payment_date, 1, 7) AS month, COALESCE(SUM(amount_paid), 0) AS total
-         FROM teacher_payments WHERE substr(payment_date, 1, 4) = ? GROUP BY month`
-      )
+    const expenseRows = getDb('finance')
+      .prepare(`SELECT substr(payment_date, 1, 7) AS month, COALESCE(SUM(amount_paid), 0) AS total FROM teacher_payments WHERE substr(payment_date, 1, 4) = ? GROUP BY month`)
       .all(y) as { month: string; total: number }[]
     const incomeMap = new Map(incomeRows.map((r) => [r.month, r.total]))
     const expenseMap = new Map(expenseRows.map((r) => [r.month, r.total]))
@@ -1030,80 +1056,386 @@ function registerFinanceHandlers(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 助教（仅 assistant 角色；课程内容记录与短信生成）
+// ---------------------------------------------------------------------------
+
+interface LessonNoteRow {
+  id: number
+  schedule_instance_id: number
+  knowledge_points: string | null
+  class_performance: string | null
+  homework: string | null
+  summary: string | null
+  homework_grading: string
+  created_at: string
+  updated_at: string
+}
+
+/** 教务库课程实例标签（助教库无实例数据，跨库只读联表） */
+function instanceLabelOf(scheduleInstanceId: number): string | undefined {
+  const si = getDb('academic')
+    .prepare(
+      `SELECT si.date, si.start_time, si.end_time, c.subject, c.grade, c.class_name,
+              COALESCE(act.name, def.name) AS teacher_name
+       FROM schedule_instances si
+       JOIN courses c ON c.id = si.course_id
+       LEFT JOIN teachers def ON def.id = c.default_teacher_id
+       LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+       WHERE si.id = ?`
+    )
+    .get(scheduleInstanceId) as
+    | { date: string; start_time: string; end_time: string; subject: string; grade: string; class_name: string; teacher_name: string | null }
+    | undefined
+  if (!si) return undefined
+  return `${si.date} ${courseLabel(si.subject, si.grade, si.class_name)} ${si.start_time}-${si.end_time}`
+}
+
+function mapLessonNote(row: LessonNoteRow): LessonNote {
+  const si = getDb('academic')
+    .prepare(
+      `SELECT si.date, si.start_time, si.end_time, c.subject, c.grade, c.class_name,
+              COALESCE(act.name, def.name) AS teacher_name
+       FROM schedule_instances si
+       JOIN courses c ON c.id = si.course_id
+       LEFT JOIN teachers def ON def.id = c.default_teacher_id
+       LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+       WHERE si.id = ?`
+    )
+    .get(row.schedule_instance_id) as
+    | { date: string; start_time: string; end_time: string; subject: string; grade: string; class_name: string; teacher_name: string | null }
+    | undefined
+  return {
+    id: row.id,
+    scheduleInstanceId: row.schedule_instance_id,
+    knowledgePoints: row.knowledge_points,
+    classPerformance: row.class_performance,
+    homework: row.homework,
+    summary: row.summary,
+    homeworkGrading: row.homework_grading,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    date: si?.date,
+    startTime: si?.start_time,
+    endTime: si?.end_time,
+    subject: si?.subject,
+    grade: si?.grade,
+    className: si?.class_name,
+    teacherName: si?.teacher_name
+  }
+}
+
+function registerAssistantHandlers(): void {
+  const guard = (): void => {
+    requireRole(['assistant'])
+  }
+
+  ipcMain.handle('assistant:getLessonNote', (_e, scheduleInstanceId: number): LessonNote | null => {
+    guard()
+    const row = getDb('assistant')
+      .prepare('SELECT * FROM lesson_notes WHERE schedule_instance_id = ?')
+      .get(scheduleInstanceId) as LessonNoteRow | undefined
+    return row ? mapLessonNote(row) : null
+  })
+
+  ipcMain.handle(
+    'assistant:saveLessonNote',
+    (
+      _e,
+      data: { scheduleInstanceId: number; knowledgePoints: string | null; classPerformance: string | null; homework: string | null; summary: string | null }
+    ): LessonNote => {
+      guard()
+      if (!data.scheduleInstanceId) throw new Error('缺少课程实例')
+      const existing = getDb('assistant')
+        .prepare('SELECT id FROM lesson_notes WHERE schedule_instance_id = ?')
+        .get(data.scheduleInstanceId) as { id: number } | undefined
+      if (existing) {
+        getDb('assistant')
+          .prepare(
+            `UPDATE lesson_notes SET knowledge_points = ?, class_performance = ?, homework = ?, summary = ?,
+             updated_at = datetime('now') WHERE id = ?`
+          )
+          .run(data.knowledgePoints ?? null, data.classPerformance ?? null, data.homework ?? null, data.summary ?? null, existing.id)
+        const row = getDb('assistant').prepare('SELECT * FROM lesson_notes WHERE id = ?').get(existing.id) as LessonNoteRow
+        return mapLessonNote(row)
+      }
+      const result = getDb('assistant')
+        .prepare(
+          `INSERT INTO lesson_notes (schedule_instance_id, knowledge_points, class_performance, homework, summary)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(data.scheduleInstanceId, data.knowledgePoints ?? null, data.classPerformance ?? null, data.homework ?? null, data.summary ?? null)
+      const row = getDb('assistant').prepare('SELECT * FROM lesson_notes WHERE id = ?').get(Number(result.lastInsertRowid)) as LessonNoteRow
+      return mapLessonNote(row)
+    }
+  )
+
+  ipcMain.handle('assistant:listLessonNotes', (): LessonNote[] => {
+    guard()
+    const rows = getDb('assistant').prepare('SELECT * FROM lesson_notes ORDER BY updated_at DESC, id DESC').all() as LessonNoteRow[]
+    return rows.map(mapLessonNote)
+  })
+
+  ipcMain.handle('assistant:generateSms', async (_e, lessonNoteId: number): Promise<{ content: string }> => {
+    guard()
+    const note = getDb('assistant').prepare('SELECT * FROM lesson_notes WHERE id = ?').get(lessonNoteId) as LessonNoteRow | undefined
+    if (!note) throw new Error('课程记录不存在')
+    const mapped = mapLessonNote(note)
+    const courseText = [mapped.subject, mapped.grade, mapped.className].filter(Boolean).join('')
+    const userPrompt = [
+      `课程：${courseText || '（未知课程）'}（${mapped.date ?? '未知日期'} ${mapped.startTime ?? ''}${mapped.startTime && mapped.endTime ? '-' + mapped.endTime : ''}）`,
+      `知识点：${note.knowledge_points || '（未填写）'}`,
+      `课堂表现：${note.class_performance || '（未填写）'}`,
+      `当日作业：${note.homework || '（未填写）'}`,
+      `当日总结：${note.summary || '（未填写）'}`
+    ].join('\n')
+    const content = await callLLM(
+      'assistant',
+      'sms',
+      '你是一名教培机构的助教老师。根据课程记录，生成一段适合直接发到家长微信群的课程通知，格式参考：【课程通知】今日XX课程总结：知识点：…；课堂表现：…；作业：…；请家长督促完成，谢谢！要求：语气亲切得体、简洁（200 字以内）、不要虚构未提供的信息、只输出通知正文。',
+      userPrompt
+    )
+    // 保存到历史
+    getDb('assistant')
+      .prepare('INSERT INTO generated_messages (lesson_note_id, message_content) VALUES (?, ?)')
+      .run(lessonNoteId, content)
+    return { content }
+  })
+
+  ipcMain.handle('assistant:listMessages', (): GeneratedMessage[] => {
+    guard()
+    const rows = getDb('assistant')
+      .prepare('SELECT gm.*, ln.schedule_instance_id FROM generated_messages gm JOIN lesson_notes ln ON ln.id = gm.lesson_note_id ORDER BY gm.generated_at DESC, gm.id DESC')
+      .all() as { id: number; lesson_note_id: number; message_content: string; generated_at: string; schedule_instance_id: number }[]
+    return rows.map((r) => ({
+      id: r.id,
+      lessonNoteId: r.lesson_note_id,
+      messageContent: r.message_content,
+      generatedAt: r.generated_at,
+      instanceLabel: instanceLabelOf(r.schedule_instance_id)
+    }))
+  })
+
+  ipcMain.handle('assistant:deleteMessage', (_e, id: number): void => {
+    guard()
+    getDb('assistant').prepare('DELETE FROM generated_messages WHERE id = ?').run(id)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Agent（教务/财务智能助手）
+// ---------------------------------------------------------------------------
+
+function registerAgentHandlers(): void {
+  ipcMain.handle('agent:getAlerts', (): AgentAlert[] => {
+    const role = requireRole(['academic', 'finance', 'assistant'])
+    if (role === 'academic') return getAcademicAlerts()
+    if (role === 'finance') return getFinanceAlerts()
+    return []
+  })
+
+  ipcMain.handle(
+    'agent:checkCourseConflict',
+    (_e, data: { courseId: number | null; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }): ConflictItem[] => {
+      requireRole(['academic'])
+      return checkCourseConflict(data)
+    }
+  )
+
+  ipcMain.handle(
+    'agent:checkInstanceConflict',
+    (_e, data: { instanceId: number; date: string; startTime: string; endTime: string; actualTeacherId: number | null }): ConflictItem[] => {
+      requireRole(['academic'])
+      return checkInstanceConflict(data)
+    }
+  )
+
+  ipcMain.handle('agent:suggestSlots', (_e, instanceId: number): SlotSuggestion[] => {
+    requireRole(['academic'])
+    return suggestSlots(instanceId)
+  })
+
+  ipcMain.handle('agent:checkDuplicateName', (_e, kind: 'student' | 'teacher', name: string): { matches: string[] } => {
+    requireRole(['academic'])
+    return checkDuplicateName(kind, name)
+  })
+
+  ipcMain.handle('agent:generateReport', async (_e, kind: 'week' | 'month'): Promise<GeneratedContent> => {
+    requireRole(['academic'])
+    return generateReport(kind)
+  })
+
+  ipcMain.handle('agent:reconcile', (): ReconcileResult => {
+    requireRole(['finance'])
+    return reconcile()
+  })
+
+  ipcMain.handle(
+    'agent:checkPaymentAnomaly',
+    (_e, data: { kind: 'student' | 'teacher'; id?: number; amountPaid: number; amountDue: number }): AnomalyCheckResult => {
+      requireRole(['finance'])
+      return checkPaymentAnomaly(data)
+    }
+  )
+
+  ipcMain.handle('agent:trendAnalysis', async (): Promise<GeneratedContent> => {
+    requireRole(['finance'])
+    return trendAnalysis()
+  })
+
+  ipcMain.handle(
+    'agent:smartReport',
+    async (_e, module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]): Promise<GeneratedContent> => {
+      requireRole(['finance'])
+      return smartReport(module, columns, rows)
+    }
+  )
+}
+
+// ---------------------------------------------------------------------------
 // 设置 / 备份恢复 / 导出
 // ---------------------------------------------------------------------------
 
 function registerSettingsHandlers(): void {
-  ipcMain.handle('settings:get', (): AppSettings => {
+  ipcMain.handle('settings:get', (): RoleSettings => {
+    const role = requireRole(['academic', 'finance', 'assistant'])
     const parseArr = (key: string, fallback: string[]): string[] => {
       try {
-        const v = JSON.parse(getSetting(key) ?? '')
+        const v = JSON.parse(getSettingValue(role, key) ?? '')
         return Array.isArray(v) ? v.map(String) : fallback
       } catch {
         return fallback
       }
     }
-    return {
-      grades: parseArr('grades', ['高一', '高二', '高三']),
-      paymentMethods: parseArr('payment_methods', ['微信', '转账', '现金']),
-      scheduleWeeks: parseInt(getSetting('schedule_weeks') ?? '8', 10) || 8,
-      chargeAbsent: (getSetting('charge_absent') ?? '1') === '1'
+    const flag = (key: string, def = '1'): boolean => (getSettingValue(role, key) ?? def) === '1'
+    if (role === 'academic') {
+      const s: AcademicSettings = {
+        role: 'academic',
+        grades: parseArr('grades', ['高一', '高二', '高三']),
+        scheduleWeeks: parseInt(getSettingValue(role, 'schedule_weeks') ?? '8', 10) || 8,
+        agentConflictDetect: flag('agent_conflict_detect'),
+        agentAttendanceAlert: flag('agent_attendance_alert'),
+        agentAttendanceThreshold: parseInt(getSettingValue(role, 'agent_attendance_threshold') ?? '3', 10) || 3,
+        agentCompletenessHint: flag('agent_completeness_hint'),
+        apiUrl: (getSettingValue(role, 'ai_api_url') ?? '').trim(),
+        apiKey: (getSettingValue(role, 'ai_api_key') ?? '').trim()
+      }
+      return s
     }
+    if (role === 'finance') {
+      const s: FinanceSettings = {
+        role: 'finance',
+        paymentMethods: parseArr('payment_methods', ['微信', '转账', '现金']),
+        chargeAbsent: flag('charge_absent'),
+        agentOverdueAlert: flag('agent_overdue_alert'),
+        agentOverdueDays: parseInt(getSettingValue(role, 'agent_overdue_days') ?? '7', 10) || 7,
+        agentAnomalyDetect: flag('agent_anomaly_detect'),
+        agentAnomalyMultiplier: parseFloat(getSettingValue(role, 'agent_anomaly_multiplier') ?? '3') || 3,
+        apiUrl: (getSettingValue(role, 'ai_api_url') ?? '').trim(),
+        apiKey: (getSettingValue(role, 'ai_api_key') ?? '').trim()
+      }
+      return s
+    }
+    const s: AssistantSettings = {
+      role: 'assistant',
+      apiUrl: (getSettingValue(role, 'ai_api_url') ?? '').trim(),
+      apiKey: (getSettingValue(role, 'ai_api_key') ?? '').trim()
+    }
+    return s
   })
 
-  // 应用版本号（打包后读取自安装包内的 package.json，用于"关于"页展示）
+  ipcMain.handle('settings:save', (_e, data: RoleSettings): void => {
+    const role = requireRole(['academic', 'finance', 'assistant'])
+    const set = (key: string, value: string): void => setSettingValue(role, key, value)
+    if (role === 'academic') {
+      const s = data as AcademicSettings
+      const grades = (s.grades ?? []).map(String).filter((x) => x.trim())
+      if (grades.length === 0) throw new Error('年级选项不能为空')
+      set('grades', JSON.stringify(grades))
+      set('schedule_weeks', String(Math.max(1, Math.min(52, Number(s.scheduleWeeks) || 8))))
+      set('agent_conflict_detect', s.agentConflictDetect ? '1' : '0')
+      set('agent_attendance_alert', s.agentAttendanceAlert ? '1' : '0')
+      set('agent_attendance_threshold', String(Math.max(1, Math.min(10, Number(s.agentAttendanceThreshold) || 3))))
+      set('agent_completeness_hint', s.agentCompletenessHint ? '1' : '0')
+      set('ai_api_url', String(s.apiUrl ?? '').trim())
+      set('ai_api_key', String(s.apiKey ?? '').trim())
+      return
+    }
+    if (role === 'finance') {
+      const s = data as FinanceSettings
+      const methods = (s.paymentMethods ?? []).map(String).filter((x) => x.trim())
+      if (methods.length === 0) throw new Error('缴费方式不能为空')
+      set('payment_methods', JSON.stringify(methods))
+      set('charge_absent', s.chargeAbsent ? '1' : '0')
+      set('agent_overdue_alert', s.agentOverdueAlert ? '1' : '0')
+      set('agent_overdue_days', String(Math.max(1, Math.min(30, Number(s.agentOverdueDays) || 7))))
+      set('agent_anomaly_detect', s.agentAnomalyDetect ? '1' : '0')
+      set('agent_anomaly_multiplier', String(Math.max(1, Math.min(10, Number(s.agentAnomalyMultiplier) || 3))))
+      set('ai_api_url', String(s.apiUrl ?? '').trim())
+      set('ai_api_key', String(s.apiKey ?? '').trim())
+      return
+    }
+    const s = data as AssistantSettings
+    set('ai_api_url', String(s.apiUrl ?? '').trim())
+    set('ai_api_key', String(s.apiKey ?? '').trim())
+  })
+
   ipcMain.handle('app:getVersion', (): string => app.getVersion())
 
-  ipcMain.handle('settings:save', (_e, data: AppSettings): void => {
-    const grades = (data.grades ?? []).map(String).filter((s) => s.trim())
-    const paymentMethods = (data.paymentMethods ?? []).map(String).filter((s) => s.trim())
-    if (grades.length === 0) throw new Error('年级选项不能为空')
-    if (paymentMethods.length === 0) throw new Error('缴费方式不能为空')
-    setSetting('grades', JSON.stringify(grades))
-    setSetting('payment_methods', JSON.stringify(paymentMethods))
-    setSetting('schedule_weeks', String(Math.max(1, Math.min(52, Number(data.scheduleWeeks) || 8))))
-    setSetting('charge_absent', data.chargeAbsent ? '1' : '0')
-  })
+  // ---------- 备份 / 恢复（覆盖三个角色数据库） ----------
 
   ipcMain.handle('backup:create', async (): Promise<{ success: boolean; canceled?: boolean; path?: string }> => {
+    requireRole(['academic', 'finance', 'assistant'])
+    const stamp = format(new Date(), 'yyyy-MM-dd')
     const { canceled, filePath } = await dialog.showSaveDialog({
-      title: '备份数据',
-      defaultPath: exportFileName('数据备份').replace('.xlsx', '.db'),
-      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }]
+      title: '备份数据（将生成三个数据库文件）',
+      defaultPath: `Vlearn_数据备份_${stamp}`,
+      filters: [{ name: '备份基础名', extensions: ['db'] }]
     })
     if (canceled || !filePath) return { success: false, canceled: true }
-    await getDb().backup(filePath)
-    return { success: true, path: filePath }
+    const base = filePath.replace(/\.db$/i, '')
+    const suffix: Record<Role, string> = { academic: '教务', finance: '财务', assistant: '助教' }
+    const paths: string[] = []
+    for (const role of Object.keys(suffix) as Role[]) {
+      const target = `${base}_${suffix[role]}.db`
+      await getDb(role).backup(target)
+      paths.push(target)
+    }
+    return { success: true, path: paths.join('、') }
   })
 
   ipcMain.handle('backup:restore', async (): Promise<{ success: boolean; canceled?: boolean; error?: string }> => {
-    const { canceled, filePaths } = await dialog.showOpenDialog({
-      title: '选择备份文件',
-      filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
-      properties: ['openFile']
-    })
-    if (canceled || filePaths.length === 0) return { success: false, canceled: true }
-    const src = filePaths[0]
-    try {
-      // 校验备份文件是否为有效的 Vlearn 数据库
-      const probe = new Database(src, { readonly: true })
-      const hasStudents = probe
-        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'students'`)
-        .get()
-      probe.close()
-      if (!hasStudents) throw new Error('缺少 students 表')
-    } catch (err) {
-      return { success: false, error: `所选文件不是有效的 Vlearn 备份：${(err as Error).message}` }
+    requireRole(['academic', 'finance', 'assistant'])
+    const expectTable: Record<Role, string> = { academic: 'students', finance: 'student_payments', assistant: 'lesson_notes' }
+    const files = {} as Record<Role, string>
+    for (const role of Object.keys(expectTable) as Role[]) {
+      const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: `选择${roleLabel(role)}数据库备份文件`,
+        filters: [{ name: 'SQLite 数据库', extensions: ['db'] }],
+        properties: ['openFile']
+      })
+      if (canceled || filePaths.length === 0) return { success: false, canceled: true }
+      const src = filePaths[0]
+      try {
+        const probe = new Database(src, { readonly: true })
+        const ok = probe
+          .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+          .get(expectTable[role])
+        probe.close()
+        if (!ok) throw new Error(`缺少 ${expectTable[role]} 表`)
+      } catch (err) {
+        return { success: false, error: `所选${roleLabel(role)}备份无效：${(err as Error).message}` }
+      }
+      files[role] = src
     }
     try {
-      // 关闭连接 → 覆盖数据库文件 → 重新打开
-      closeDb()
-      fs.copyFileSync(src, getDbPath())
-      initDb()
+      closeAll()
+      for (const role of Object.keys(files) as Role[]) {
+        fs.copyFileSync(files[role], getDbPath(role))
+      }
+      initDatabases()
     } catch (err) {
       return { success: false, error: `恢复失败：${(err as Error).message}` }
     }
-    // 重载渲染进程，使全部页面重新读取恢复后的数据
     for (const win of BrowserWindow.getAllWindows()) win.webContents.reload()
     return { success: true }
   })
@@ -1111,6 +1443,7 @@ function registerSettingsHandlers(): void {
   ipcMain.handle(
     'export:excel',
     async (_e, payload: ExcelExportPayload): Promise<{ success: boolean; canceled?: boolean; path?: string }> => {
+      requireRole(['academic', 'finance', 'assistant'])
       const moduleName = String(payload.module ?? '导出').slice(0, 20)
       const { canceled, filePath } = await dialog.showSaveDialog({
         title: '导出 Excel',
@@ -1125,14 +1458,15 @@ function registerSettingsHandlers(): void {
   )
 }
 
-/** 注册全部 IPC 处理器。
- *  处理器内部统一通过 getDb() 动态获取连接：恢复备份后连接会重建，闭包捕获旧连接会导致错误。 */
+/** 注册全部 IPC 处理器 */
 export function registerIpcHandlers(): void {
+  registerAuthHandlers()
   registerCourseHandlers()
   registerTeacherHandlers()
   registerStudentHandlers()
   registerInstanceHandlers()
-  registerFinanceSessionHandlers()
   registerFinanceHandlers()
+  registerAssistantHandlers()
+  registerAgentHandlers()
   registerSettingsHandlers()
 }

@@ -94,6 +94,28 @@ export default function StudentsPage(): JSX.Element {
         note: values.note?.trim() || null,
         courseIds: values.courseIds ?? []
       }
+      // Agent：新增时相似姓名检测（如"张三" vs "张 三"）
+      if (editing === 'new') {
+        const dup = await tryApi(() => api.checkDuplicateName('student', payload.name))
+        if (!dup.ok) throw new Error(dup.error)
+        if (dup.data.matches.length > 0) {
+          await new Promise<void>((resolve, reject) => {
+            Modal.confirm({
+              title: '发现相似姓名',
+              content: (
+                <div>
+                  <p>已有以下相似学生：{dup.data.matches.join('、')}</p>
+                  <p>是否仍然保存？</p>
+                </div>
+              ),
+              okText: '仍然保存',
+              cancelText: '返回检查',
+              onOk: () => resolve(),
+              onCancel: () => reject(new Error('已取消保存'))
+            })
+          })
+        }
+      }
       setSaving(true)
       const result =
         editing === 'new'

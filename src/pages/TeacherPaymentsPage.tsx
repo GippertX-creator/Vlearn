@@ -5,6 +5,7 @@
  *   应付金额 = 所属课程的单次课酬标准，实例有代课老师时支付给代课老师
  * - 按老师、课程筛选；底部合计行展示应付合计与实付合计
  * - 新增 / 编辑弹窗：选择课程实例后按所属课程单次课酬自动带出应付金额
+ * - 保存前异常交易检测：调用 checkPaymentAnomaly（本地规则），存在异常时弹窗确认是否仍然保存
  */
 import {
   CalculatorOutlined,
@@ -150,6 +151,42 @@ export default function TeacherPaymentsPage(): JSX.Element {
     if (pay !== undefined) form.setFieldsValue({ amountDue: pay })
   }
 
+  /**
+   * 保存前异常交易检测：后台按财务设置的异常倍数等本地规则校验；
+   * 存在异常时弹窗二次确认，"仍然保存"放行、"返回检查"取消本次保存。
+   */
+  const confirmSaveIfAnomaly = async (amountDue: number, amountPaid: number): Promise<void> => {
+    const check = await tryApi(() =>
+      api.checkPaymentAnomaly({
+        kind: 'teacher',
+        id: editing === 'new' ? undefined : (editing as TeacherPayment).id,
+        amountPaid,
+        amountDue
+      })
+    )
+    if (!check.ok) throw new Error(check.error)
+    if (check.data.anomalies.length > 0) {
+      await new Promise<void>((resolve, reject) => {
+        Modal.confirm({
+          title: '异常交易提醒',
+          width: 560,
+          content: (
+            <div>
+              {check.data.anomalies.map((a) => (
+                <p key={a.message}>⚠️ {a.message}</p>
+              ))}
+              <p>是否仍然保存？</p>
+            </div>
+          ),
+          okText: '仍然保存',
+          cancelText: '返回检查',
+          onOk: () => resolve(),
+          onCancel: () => reject(new Error('已取消保存'))
+        })
+      })
+    }
+  }
+
   const handleSave = async (): Promise<void> => {
     let values: PaymentFormValues
     try {
@@ -167,19 +204,22 @@ export default function TeacherPaymentsPage(): JSX.Element {
       note: values.note?.trim() || null
     }
     setSaving(true)
-    const res =
-      editing === 'new'
-        ? await tryApi(() => api.createTeacherPayment(payload))
-        : await tryApi(() => api.updateTeacherPayment((editing as TeacherPayment).id, payload))
-    if (!res.ok) {
-      message.error(res.error)
+    try {
+      // 保存前异常检测（通过则继续，异常时用户确认后放行）
+      await confirmSaveIfAnomaly(values.amountDue, values.amountPaid)
+      const res =
+        editing === 'new'
+          ? await tryApi(() => api.createTeacherPayment(payload))
+          : await tryApi(() => api.updateTeacherPayment((editing as TeacherPayment).id, payload))
+      if (!res.ok) throw new Error(res.error)
+      message.success(editing === 'new' ? '课酬记录已添加' : '课酬记录已保存')
+      setEditing(null)
+      await load()
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
       setSaving(false)
-      return
     }
-    message.success(editing === 'new' ? '课酬记录已添加' : '课酬记录已保存')
-    setEditing(null)
-    setSaving(false)
-    await load()
   }
 
   const handleDelete = async (p: TeacherPayment): Promise<void> => {

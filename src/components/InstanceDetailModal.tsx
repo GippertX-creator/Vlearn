@@ -1,30 +1,45 @@
 /**
- * 课程实例详情弹窗：
- * - 展示课程、时间、老师、状态等基本信息
- * - 教务可操作考勤（出勤/请假/缺勤，三选一，默认未标记，修改立即保存）
- * - 支持一键"全部出勤"、导出本次考勤
- * - 支持单次调课（日期/时间/代课老师）与取消/恢复
+ * 课程实例详情弹窗（v2 角色适配）：
+ * - 教务：可操作考勤（出勤/请假/缺勤 + 一键全部出勤）、单次调课（含冲突检测与
+ *   智能推荐时间段）、取消/恢复本次课
+ * - 助教：只读查看学生名单与考勤状态，提供"课程内容记录"入口（记录与短信生成）
+ * - 考勤变更后触发 vlearn:refresh-alerts 事件，让右侧助手面板立即刷新提醒
  */
 import {
   CheckCircleOutlined,
+  BulbOutlined,
   CloseCircleOutlined,
   EditOutlined,
   RollbackOutlined,
   ScheduleOutlined
 } from '@ant-design/icons'
-import { App as AntdApp, Button, DatePicker, Descriptions, Form, Input, Modal, Popconfirm, Select, Space, Table, Tag, TimePicker } from 'antd'
+import {
+  App as AntdApp,
+  Button,
+  DatePicker,
+  Descriptions,
+  Form,
+  Input,
+  Modal,
+  Popconfirm,
+  Select,
+  Space,
+  Table,
+  Tag,
+  TimePicker
+} from 'antd'
 import dayjs, { Dayjs } from 'dayjs'
 import { useCallback, useEffect, useState } from 'react'
 import { api, getErrorMessage } from '../api'
-import type { AttendanceStatus, InstanceDetail, ScheduleInstance, Teacher } from '../types'
+import { useRole } from '../roleContext'
+import type { AttendanceStatus, ConflictItem, InstanceDetail, ScheduleInstance, SlotSuggestion, Teacher } from '../types'
 import AttendanceStatusTag from './AttendanceStatusTag'
 import ExportExcelButton from './ExportExcelButton'
+import LessonNoteEditorModal from './LessonNoteEditorModal'
 
 interface InstanceDetailModalProps {
   instanceId: number | null
-  /** 弹窗关闭（不传 instanceId 即关闭） */
   onClose: () => void
-  /** 实例或考勤发生变化（父组件需刷新日历数据） */
   onChanged: () => void
 }
 
@@ -35,15 +50,38 @@ function StatusTag({ status }: { status: ScheduleInstance['status'] }): JSX.Elem
   return <Tag color="blue">正常</Tag>
 }
 
+/** 冲突清单内容 */
+function ConflictList({ conflicts }: { conflicts: ConflictItem[] }): JSX.Element {
+  return (
+    <div>
+      <p style={{ color: '#fa8c16' }}>检测到以下时间冲突：</p>
+      <ul style={{ paddingLeft: 20, maxHeight: 220, overflow: 'auto' }}>
+        {conflicts.map((c, i) => (
+          <li key={i}>
+            {c.type === 'teacher' ? '老师' : '学生'}「{c.who}」在 {c.date} {c.startTime}-{c.endTime} 已有
+            「{c.courseLabel}」的课程
+          </li>
+        ))}
+      </ul>
+      <p>是否仍然保存？</p>
+    </div>
+  )
+}
+
 export default function InstanceDetailModal({ instanceId, onClose, onChanged }: InstanceDetailModalProps): JSX.Element {
   const { message } = AntdApp.useApp()
+  const role = useRole()
+  /** 助教为只读模式 */
+  const readonly = role === 'assistant'
   const [detail, setDetail] = useState<InstanceDetail | null>(null)
   const [teachers, setTeachers] = useState<Teacher[]>([])
   const [loading, setLoading] = useState(false)
-  /** 是否处于调课编辑状态 */
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [adjustForm] = Form.useForm()
+  /** 智能推荐时间段 */
+  const [suggestions, setSuggestions] = useState<SlotSuggestion[]>([])
+  const [noteEditorOpen, setNoteEditorOpen] = useState(false)
 
   const loadDetail = useCallback(async () => {
     if (!instanceId) return
@@ -62,11 +100,12 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
 
   useEffect(() => {
     setEditing(false)
+    setSuggestions([])
     adjustForm.resetFields()
     loadDetail()
   }, [instanceId, loadDetail, adjustForm])
 
-  // ---------- 考勤操作 ----------
+  // ---------- 考勤操作（仅教务） ----------
 
   const handleAttendanceChange = async (studentId: number, status: AttendanceStatus | null): Promise<void> => {
     if (!detail) return
@@ -78,6 +117,7 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
       }
       await loadDetail()
       onChanged()
+      window.dispatchEvent(new CustomEvent('vlearn:refresh-alerts'))
     } catch (err) {
       message.error(getErrorMessage(err))
     }
@@ -90,46 +130,86 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
       message.success(`已将 ${n} 名学生标记为出勤`)
       await loadDetail()
       onChanged()
+      window.dispatchEvent(new CustomEvent('vlearn:refresh-alerts'))
     } catch (err) {
       message.error(getErrorMessage(err))
     }
   }
 
-  // ---------- 调课 / 取消 / 恢复 ----------
+  // ---------- 调课 / 取消 / 恢复（仅教务） ----------
 
   const startEditing = (): void => {
     if (!detail) return
     adjustForm.setFieldsValue({
       date: dayjs(detail.instance.date),
-      time: [dayjs(detail.instance.date + ' ' + detail.instance.startTime, 'YYYY-MM-DD HH:mm'), dayjs(detail.instance.date + ' ' + detail.instance.endTime, 'YYYY-MM-DD HH:mm')],
+      time: [
+        dayjs(detail.instance.date + ' ' + detail.instance.startTime, 'YYYY-MM-DD HH:mm'),
+        dayjs(detail.instance.date + ' ' + detail.instance.endTime, 'YYYY-MM-DD HH:mm')
+      ],
       actualTeacherId: detail.instance.actualTeacherId ?? detail.course.defaultTeacherId,
       note: detail.instance.note
     })
+    setSuggestions([])
     setEditing(true)
   }
 
-  const handleSaveAdjust = async (): Promise<void> => {
+  /** Agent：智能推荐时间段（未来 7 天老师的空闲时段） */
+  const handleSuggest = async (): Promise<void> => {
     if (!detail) return
     try {
-      const values = await adjustForm.validateFields()
-      const { date, time, actualTeacherId, note } = values as {
-        date: Dayjs
-        time: [Dayjs, Dayjs]
-        actualTeacherId: number | null
-        note?: string | null
+      const slots = await api.suggestSlots(detail.instance.id)
+      setSuggestions(slots)
+      if (slots.length === 0) message.info('未来 7 天暂未找到空闲时段，可手动选择时间')
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    }
+  }
+
+  const doSaveAdjust = async (force: boolean): Promise<void> => {
+    if (!detail) return
+    const values = await adjustForm.validateFields()
+    const { date, time, actualTeacherId, note } = values as {
+      date: Dayjs
+      time: [Dayjs, Dayjs]
+      actualTeacherId: number | null
+      note?: string | null
+    }
+    const payload = {
+      date: date.format('YYYY-MM-DD'),
+      startTime: time[0].format('HH:mm'),
+      endTime: time[1].format('HH:mm'),
+      actualTeacherId: actualTeacherId ?? null,
+      note: note ?? null
+    }
+    // Agent：保存前冲突检测
+    if (!force) {
+      const conflicts = await api.checkInstanceConflict({ instanceId: detail.instance.id, ...payload })
+      if (conflicts.length > 0) {
+        await new Promise<void>((resolve, reject) => {
+          Modal.confirm({
+            title: `检测到 ${conflicts.length} 处时间冲突`,
+            width: 560,
+            content: <ConflictList conflicts={conflicts} />,
+            okText: '仍然保存',
+            cancelText: '返回检查',
+            onOk: () => resolve(),
+            onCancel: () => reject(new Error('已取消保存'))
+          })
+        })
       }
-      setSaving(true)
-      await api.updateInstance(detail.instance.id, {
-        date: date.format('YYYY-MM-DD'),
-        startTime: time[0].format('HH:mm'),
-        endTime: time[1].format('HH:mm'),
-        actualTeacherId: actualTeacherId ?? null,
-        note: note ?? null
-      })
-      message.success('调课已保存')
-      setEditing(false)
-      await loadDetail()
-      onChanged()
+    }
+    setSaving(true)
+    await api.updateInstance(detail.instance.id, payload)
+    message.success('调课已保存')
+    setEditing(false)
+    setSuggestions([])
+    await loadDetail()
+    onChanged()
+  }
+
+  const handleSaveAdjust = async (): Promise<void> => {
+    try {
+      await doSaveAdjust(false)
     } catch (err) {
       if (err instanceof Error && err.message) message.error(getErrorMessage(err))
     } finally {
@@ -185,21 +265,24 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
       title: '考勤状态',
       key: 'status',
       width: 180,
-      render: (_: unknown, row: { id: number; attendanceStatus: AttendanceStatus | null }) => (
-        <Select
-          size="small"
-          allowClear
-          placeholder="未标记"
-          style={{ width: 120 }}
-          value={row.attendanceStatus}
-          onChange={(v) => handleAttendanceChange(row.id, (v as AttendanceStatus | null) ?? null)}
-          options={[
-            { value: 'present', label: '出勤' },
-            { value: 'leave', label: '请假' },
-            { value: 'absent', label: '缺勤' }
-          ]}
-        />
-      )
+      render: (_: unknown, row: { id: number; attendanceStatus: AttendanceStatus | null }) =>
+        readonly ? (
+          <AttendanceStatusTag status={row.attendanceStatus} />
+        ) : (
+          <Select
+            size="small"
+            allowClear
+            placeholder="未标记"
+            style={{ width: 120 }}
+            value={row.attendanceStatus}
+            onChange={(v) => handleAttendanceChange(row.id, (v as AttendanceStatus | null) ?? null)}
+            options={[
+              { value: 'present', label: '出勤' },
+              { value: 'leave', label: '请假' },
+              { value: 'absent', label: '缺勤' }
+            ]}
+          />
+        )
     }
   ]
 
@@ -247,8 +330,8 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
             </Descriptions.Item>
           </Descriptions>
 
-          {/* 调课表单 */}
-          {editing && (
+          {/* 调课表单（仅教务） */}
+          {editing && !readonly && (
             <Form
               form={adjustForm}
               layout="inline"
@@ -273,8 +356,11 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
               </Form.Item>
               <Form.Item>
                 <Space>
-                  <Button type="primary" size="small" loading={saving} onClick={handleSaveAdjust}>
+                  <Button type="primary" size="small" loading={saving} onClick={() => void handleSaveAdjust()}>
                     保存
+                  </Button>
+                  <Button size="small" icon={<BulbOutlined />} onClick={() => void handleSuggest()}>
+                    智能推荐时间
                   </Button>
                   <Button size="small" onClick={() => setEditing(false)}>
                     取消
@@ -284,34 +370,65 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
             </Form>
           )}
 
+          {/* 智能推荐时间段（教务） */}
+          {suggestions.length > 0 && !readonly && (
+            <div style={{ marginBottom: 16, background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, padding: 10 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>智能推荐时间段（授课老师空闲）：</div>
+              <Space wrap>
+                {suggestions.map((s, i) => (
+                  <Button
+                    key={i}
+                    size="small"
+                    onClick={() =>
+                      adjustForm.setFieldsValue({
+                        date: dayjs(s.date),
+                        time: [dayjs(s.date + ' ' + s.startTime, 'YYYY-MM-DD HH:mm'), dayjs(s.date + ' ' + s.endTime, 'YYYY-MM-DD HH:mm')]
+                      })
+                    }
+                  >
+                    {s.date} {s.startTime}-{s.endTime}
+                  </Button>
+                ))}
+              </Space>
+            </div>
+          )}
+
           {/* 操作按钮 */}
           <Space wrap style={{ marginBottom: 16 }}>
-            {instance.status !== 'cancelled' && (
+            {!readonly && instance.status !== 'cancelled' && (
               <Button icon={<EditOutlined />} onClick={startEditing} disabled={editing}>
                 单次调课
               </Button>
             )}
-            {instance.status === 'cancelled' ? (
-              <Button icon={<RollbackOutlined />} onClick={handleRestoreInstance}>
-                恢复本次课
-              </Button>
-            ) : (
-              <Popconfirm
-                title="确认取消本次课？"
-                description="取消后仍可恢复；已产生的考勤记录会保留。"
-                okText="取消本次课"
-                cancelText="再想想"
-                okButtonProps={{ danger: true }}
-                onConfirm={handleCancelInstance}
-              >
-                <Button danger icon={<CloseCircleOutlined />}>
-                  取消本次课
+            {!readonly &&
+              (instance.status === 'cancelled' ? (
+                <Button icon={<RollbackOutlined />} onClick={() => void handleRestoreInstance()}>
+                  恢复本次课
                 </Button>
-              </Popconfirm>
+              ) : (
+                <Popconfirm
+                  title="确认取消本次课？"
+                  description="取消后仍可恢复；已产生的考勤记录会保留。"
+                  okText="取消本次课"
+                  cancelText="再想想"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => void handleCancelInstance()}
+                >
+                  <Button danger icon={<CloseCircleOutlined />}>
+                    取消本次课
+                  </Button>
+                </Popconfirm>
+              ))}
+            {!readonly && (
+              <Button type="primary" ghost icon={<CheckCircleOutlined />} onClick={() => void handleAllPresent()}>
+                全部出勤
+              </Button>
             )}
-            <Button type="primary" ghost icon={<CheckCircleOutlined />} onClick={handleAllPresent}>
-              全部出勤
-            </Button>
+            {readonly && (
+              <Button type="primary" icon={<EditOutlined />} onClick={() => setNoteEditorOpen(true)}>
+                课程内容记录
+              </Button>
+            )}
             <ExportExcelButton
               module="考勤记录"
               columns={[
@@ -330,38 +447,34 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
             <span style={{ fontWeight: 600 }}>学生考勤（{students.length} 人）</span>
           </div>
           {students.length === 0 ? (
-            <div style={{ color: '#999', padding: '16px 0' }}>
-              暂无报名学生。请先在「学生管理」中为该课程添加学生。
-            </div>
+            <div style={{ color: '#999', padding: '16px 0' }}>暂无报名学生。</div>
           ) : (
-            <Table
-              size="small"
-              columns={attendanceColumns}
-              dataSource={attendanceRows}
-              pagination={false}
-              scroll={{ y: 320 }}
-            />
+            <Table size="small" columns={attendanceColumns} dataSource={attendanceRows} pagination={false} scroll={{ y: 320 }} />
           )}
 
           {/* 出勤情况小结 */}
           {students.length > 0 && (
             <Space style={{ marginTop: 12 }} size={16}>
               <span>
-                <AttendanceStatusTag status="present" /> ×
-                {students.filter((s) => s.attendanceStatus === 'present').length}
+                <AttendanceStatusTag status="present" /> ×{students.filter((s) => s.attendanceStatus === 'present').length}
               </span>
               <span>
-                <AttendanceStatusTag status="leave" /> ×
-                {students.filter((s) => s.attendanceStatus === 'leave').length}
+                <AttendanceStatusTag status="leave" /> ×{students.filter((s) => s.attendanceStatus === 'leave').length}
               </span>
               <span>
-                <AttendanceStatusTag status="absent" /> ×
-                {students.filter((s) => s.attendanceStatus === 'absent').length}
+                <AttendanceStatusTag status="absent" /> ×{students.filter((s) => s.attendanceStatus === 'absent').length}
               </span>
-              <span style={{ color: '#999' }}>
-                未标记 ×{students.filter((s) => !s.attendanceStatus).length}
-              </span>
+              <span style={{ color: '#999' }}>未标记 ×{students.filter((s) => !s.attendanceStatus).length}</span>
             </Space>
+          )}
+
+          {/* 助教：课程内容记录 */}
+          {readonly && (
+            <LessonNoteEditorModal
+              scheduleInstanceId={noteEditorOpen ? instance.id : null}
+              onClose={() => setNoteEditorOpen(false)}
+              onChanged={onChanged}
+            />
           )}
         </>
       )}

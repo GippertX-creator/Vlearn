@@ -53,7 +53,7 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
       const [c, t, s] = await Promise.all([api.getCourses(), api.getTeachers(), api.getSettings()])
       setCourses(c)
       setTeachers(t)
-      setGrades(s.grades)
+      if (s.role === 'academic') setGrades(s.grades)
     } catch (err) {
       message.error(getErrorMessage(err))
     } finally {
@@ -102,6 +102,43 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
         className: values.className.trim(),
         defaultTeacherId: values.defaultTeacherId ?? null,
         scheduleRule
+      }
+      // Agent：保存前排课冲突检测（默认老师与既有课程时间重叠）
+      const conflicts = await tryApi(() =>
+        api.checkCourseConflict({
+          courseId: editing !== 'new' && editing !== null ? editing.id : null,
+          defaultTeacherId: payload.defaultTeacherId,
+          scheduleRule: payload.scheduleRule
+        })
+      )
+      if (!conflicts.ok) throw new Error(conflicts.error)
+      if (conflicts.data.length > 0) {
+        const items = conflicts.data.slice(0, 6)
+        const more = conflicts.data.length - items.length
+        await new Promise<void>((resolve, reject) => {
+          Modal.confirm({
+            title: `检测到 ${conflicts.data.length} 处排课冲突`,
+            width: 560,
+            content: (
+              <div>
+                <p style={{ color: '#fa8c16' }}>默认授课老师在以下时间已有课程（时间重叠）：</p>
+                <ul style={{ paddingLeft: 20, maxHeight: 200, overflow: 'auto' }}>
+                  {items.map((c, i) => (
+                    <li key={i}>
+                      {c.date} {c.startTime}-{c.endTime} · {c.courseLabel}
+                    </li>
+                  ))}
+                  {more > 0 && <li>…等 {more} 项</li>}
+                </ul>
+                <p>是否仍然保存该课程？</p>
+              </div>
+            ),
+            okText: '仍然保存',
+            cancelText: '返回检查',
+            onOk: () => resolve(),
+            onCancel: () => reject(new Error('已取消保存'))
+          })
+        })
       }
       setSaving(true)
       if (editing === 'new') {

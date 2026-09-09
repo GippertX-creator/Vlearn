@@ -63,6 +63,19 @@ import {
   trendAnalysis
 } from './agent'
 import { callLLM } from './ai'
+import { SMS_SYSTEM_PROMPT } from './prompts'
+import {
+  buildSyncPackage,
+  getCampusId,
+  getCampusInfo,
+  getSyncHistory,
+  mergeSyncPackage,
+  packageRowCount,
+  recordExportHistory,
+  setCampusName,
+  SyncPackage,
+  SyncStats
+} from './sync'
 import { changePassword, login, logout, requireRole, roleLabel } from './auth'
 import { closeAll, getDb, getDbPath, getMigrationError, getSettingValue, initDatabases, setSettingValue } from './db'
 import { buildWorkbook, exportFileName } from './excelExport'
@@ -71,6 +84,26 @@ import { generateInstances } from './schedule'
 /** 教务读权限：三角色均可 */
 function guardAcademicRead(): void {
   requireRole(['academic', 'finance', 'assistant'])
+}
+
+// ---------------------------------------------------------------------------
+// 多校区同步埋点（v3）
+// ---------------------------------------------------------------------------
+
+/** 记录删除墓碑（供同步包传播删除操作；table 决定所在角色库） */
+function tombstone(table: string, rowId: string | number): void {
+  const db = getDb(table === 'lesson_notes' ? 'assistant' : 'academic')
+  db.prepare('INSERT INTO sync_tombstones (table_name, row_id, deleted_at, sync_origin) VALUES (?, ?, ?, ?)').run(
+    table,
+    String(rowId),
+    format(new Date(), 'yyyy-MM-dd HH:mm:ss'),
+    getCampusId()
+  )
+}
+
+/** 当前校区标识（写路径注入 sync_origin） */
+function localCampus(): string {
+  return getCampusId()
 }
 
 // ---------------------------------------------------------------------------
@@ -239,13 +272,13 @@ function registerCourseHandlers(): void {
       if (!subject || !grade || !className) throw new Error('科目、年级、班级号不能为空')
       const result = getDb('academic')
         .prepare(
-          `INSERT INTO courses (subject, grade, class_name, default_teacher_id, default_schedule_rule)
-           VALUES (?, ?, ?, ?, ?)`
+          `INSERT INTO courses (subject, grade, class_name, default_teacher_id, default_schedule_rule, sync_origin)
+           VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []))
+        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), localCampus())
       const courseId = Number(result.lastInsertRowid)
       const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
-      generateInstances(getDb('academic'), courseId, data.scheduleRule ?? [], new Date(), weeks)
+      generateInstances(getDb('academic'), courseId, data.scheduleRule ?? [], new Date(), weeks, localCampus())
       return fetchCourse(courseId)!
     }
   )
@@ -278,7 +311,27 @@ function registerCourseHandlers(): void {
     // 跨库清理：财务库中与该课程相关的外键引用（外键无法跨库声明）
     const instanceIds = (getDb('academic').prepare('SELECT id FROM schedule_instances WHERE course_id = ?').all(id) as { id: number }[])
       .map((r) => r.id)
+    const attendanceIds = instanceIds.length
+      ? (getDb('academic')
+          .prepare(`SELECT schedule_instance_id, student_id FROM attendances WHERE schedule_instance_id IN (${instanceIds.map(() => '?').join(',')})`)
+          .all(...instanceIds) as { schedule_instance_id: number; student_id: number }[])
+      : []
+    const junctionPairs = [
+      ...(getDb('academic').prepare('SELECT teacher_id, course_id FROM teacher_courses WHERE course_id = ?').all(id) as {
+        teacher_id: number
+        course_id: number
+      }[]).map((r) => ({ table: 'teacher_courses', rowId: `${r.teacher_id}-${r.course_id}` })),
+      ...(getDb('academic').prepare('SELECT student_id, course_id FROM student_courses WHERE course_id = ?').all(id) as {
+        student_id: number
+        course_id: number
+      }[]).map((r) => ({ table: 'student_courses', rowId: `${r.student_id}-${r.course_id}` }))
+    ]
     const tx = getDb('academic').transaction(() => {
+      // 同步墓碑：级联删除的实例、考勤、关联关系都需要传播到其他校区
+      for (const iid of instanceIds) tombstone('schedule_instances', iid)
+      for (const a of attendanceIds) tombstone('attendances', `${a.schedule_instance_id}-${a.student_id}`)
+      for (const j of junctionPairs) tombstone(j.table, j.rowId)
+      tombstone('courses', id)
       if (instanceIds.length > 0) {
         const placeholders = instanceIds.map(() => '?').join(',')
         getDb('finance').prepare(`DELETE FROM teacher_payments WHERE schedule_instance_id IN (${placeholders})`).run(...instanceIds)
@@ -300,7 +353,14 @@ function registerCourseHandlers(): void {
         id: number
       }[]
     ).map((r) => r.id)
+    const deletedAttendances = deletedIds.length
+      ? (getDb('academic')
+          .prepare(`SELECT schedule_instance_id, student_id FROM attendances WHERE schedule_instance_id IN (${deletedIds.map(() => '?').join(',')})`)
+          .all(...deletedIds) as { schedule_instance_id: number; student_id: number }[])
+      : []
     const tx = getDb('academic').transaction(() => {
+      for (const iid of deletedIds) tombstone('schedule_instances', iid)
+      for (const a of deletedAttendances) tombstone('attendances', `${a.schedule_instance_id}-${a.student_id}`)
       if (deletedIds.length > 0) {
         const placeholders = deletedIds.map(() => '?').join(',')
         getDb('finance').prepare(`DELETE FROM teacher_payments WHERE schedule_instance_id IN (${placeholders})`).run(...deletedIds)
@@ -309,7 +369,7 @@ function registerCourseHandlers(): void {
     })
     tx()
     const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
-    return generateInstances(getDb('academic'), courseId, course.scheduleRule, new Date(), weeks)
+    return generateInstances(getDb('academic'), courseId, course.scheduleRule, new Date(), weeks, localCampus())
   })
 }
 
@@ -365,9 +425,19 @@ function registerTeacherHandlers(): void {
 
   const replaceTeacherCourses = (teacherId: number, courseIds: number[]): void => {
     const tx = getDb('academic').transaction(() => {
+      // 同步墓碑：仅对被移除的关联记录墓碑（新增/保留的不用，避免时间戳边界问题）
+      const existing = getDb('academic').prepare('SELECT course_id FROM teacher_courses WHERE teacher_id = ?').all(teacherId) as {
+        course_id: number
+      }[]
+      const nextSet = new Set(courseIds)
+      for (const r of existing) {
+        if (!nextSet.has(r.course_id)) tombstone('teacher_courses', `${teacherId}-${r.course_id}`)
+      }
       getDb('academic').prepare('DELETE FROM teacher_courses WHERE teacher_id = ?').run(teacherId)
-      const insert = getDb('academic').prepare('INSERT INTO teacher_courses (teacher_id, course_id) VALUES (?, ?)')
-      for (const courseId of courseIds) insert.run(teacherId, courseId)
+      const insert = getDb('academic').prepare(
+        `INSERT INTO teacher_courses (teacher_id, course_id, updated_at, sync_origin) VALUES (?, ?, datetime('now'), ?)`
+      )
+      for (const courseId of courseIds) insert.run(teacherId, courseId, localCampus())
     })
     tx()
   }
@@ -376,7 +446,9 @@ function registerTeacherHandlers(): void {
     requireRole(['academic'])
     const name = String(data.name ?? '').trim()
     if (!name) throw new Error('老师姓名不能为空')
-    const result = getDb('academic').prepare('INSERT INTO teachers (name, note) VALUES (?, ?)').run(name, data.note ?? null)
+    const result = getDb('academic')
+      .prepare(`INSERT INTO teachers (name, note, sync_origin) VALUES (?, ?, ?)`)
+      .run(name, data.note ?? null, localCampus())
     const id = Number(result.lastInsertRowid)
     replaceTeacherCourses(id, data.courseIds ?? [])
     return {
@@ -392,7 +464,9 @@ function registerTeacherHandlers(): void {
     requireRole(['academic'])
     const name = String(data.name ?? '').trim()
     if (!name) throw new Error('老师姓名不能为空')
-    getDb('academic').prepare('UPDATE teachers SET name = ?, note = ? WHERE id = ?').run(name, data.note ?? null, id)
+    getDb('academic')
+      .prepare(`UPDATE teachers SET name = ?, note = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(name, data.note ?? null, id)
     replaceTeacherCourses(id, data.courseIds ?? [])
     return {
       id,
@@ -405,8 +479,13 @@ function registerTeacherHandlers(): void {
 
   ipcMain.handle('teachers:delete', (_e, id: number): void => {
     requireRole(['academic'])
+    const junctionPairs = (getDb('academic').prepare('SELECT course_id FROM teacher_courses WHERE teacher_id = ?').all(id) as {
+      course_id: number
+    }[]).map((r) => ({ table: 'teacher_courses', rowId: `${id}-${r.course_id}` }))
     // 跨库清理财务库课酬记录
     const tx = getDb('academic').transaction(() => {
+      tombstone('teachers', id)
+      for (const j of junctionPairs) tombstone(j.table, j.rowId)
       getDb('finance').prepare('DELETE FROM teacher_payments WHERE teacher_id = ?').run(id)
       getDb('academic').prepare('DELETE FROM teachers WHERE id = ?').run(id)
     })
@@ -504,9 +583,19 @@ function registerStudentHandlers(): void {
 
   const replaceStudentCourses = (studentId: number, courseIds: number[]): void => {
     const tx = getDb('academic').transaction(() => {
+      // 同步墓碑：仅对被移除的关联记录墓碑
+      const existing = getDb('academic').prepare('SELECT course_id FROM student_courses WHERE student_id = ?').all(studentId) as {
+        course_id: number
+      }[]
+      const nextSet = new Set(courseIds)
+      for (const r of existing) {
+        if (!nextSet.has(r.course_id)) tombstone('student_courses', `${studentId}-${r.course_id}`)
+      }
       getDb('academic').prepare('DELETE FROM student_courses WHERE student_id = ?').run(studentId)
-      const insert = getDb('academic').prepare('INSERT INTO student_courses (student_id, course_id) VALUES (?, ?)')
-      for (const courseId of courseIds) insert.run(studentId, courseId)
+      const insert = getDb('academic').prepare(
+        `INSERT INTO student_courses (student_id, course_id, updated_at, sync_origin) VALUES (?, ?, datetime('now'), ?)`
+      )
+      for (const courseId of courseIds) insert.run(studentId, courseId, localCampus())
     })
     tx()
   }
@@ -518,8 +607,8 @@ function registerStudentHandlers(): void {
       const name = String(data.name ?? '').trim()
       if (!name) throw new Error('学生姓名不能为空')
       const result = getDb('academic')
-        .prepare('INSERT INTO students (name, school_class, note) VALUES (?, ?, ?)')
-        .run(name, data.schoolClass ?? null, data.note ?? null)
+        .prepare(`INSERT INTO students (name, school_class, note, sync_origin) VALUES (?, ?, ?, ?)`)
+        .run(name, data.schoolClass ?? null, data.note ?? null, localCampus())
       const id = Number(result.lastInsertRowid)
       replaceStudentCourses(id, data.courseIds ?? [])
       return {
@@ -540,7 +629,7 @@ function registerStudentHandlers(): void {
       const name = String(data.name ?? '').trim()
       if (!name) throw new Error('学生姓名不能为空')
       getDb('academic')
-        .prepare('UPDATE students SET name = ?, school_class = ?, note = ? WHERE id = ?')
+        .prepare(`UPDATE students SET name = ?, school_class = ?, note = ?, updated_at = datetime('now') WHERE id = ?`)
         .run(name, data.schoolClass ?? null, data.note ?? null, id)
       replaceStudentCourses(id, data.courseIds ?? [])
       return {
@@ -556,8 +645,17 @@ function registerStudentHandlers(): void {
 
   ipcMain.handle('students:delete', (_e, id: number): void => {
     requireRole(['academic'])
+    const junctionPairs = (getDb('academic').prepare('SELECT course_id FROM student_courses WHERE student_id = ?').all(id) as {
+      course_id: number
+    }[]).map((r) => ({ table: 'student_courses', rowId: `${id}-${r.course_id}` }))
+    const attendanceIds = (getDb('academic')
+      .prepare('SELECT schedule_instance_id FROM attendances WHERE student_id = ?')
+      .all(id) as { schedule_instance_id: number }[]).map((r) => r.schedule_instance_id)
     // 跨库清理财务库缴费记录
     const tx = getDb('academic').transaction(() => {
+      tombstone('students', id)
+      for (const j of junctionPairs) tombstone(j.table, j.rowId)
+      for (const iid of attendanceIds) tombstone('attendances', `${iid}-${id}`)
       getDb('finance').prepare('DELETE FROM student_payments WHERE student_id = ?').run(id)
       getDb('academic').prepare('DELETE FROM students WHERE id = ?').run(id)
     })
@@ -642,7 +740,8 @@ function registerInstanceHandlers(): void {
       getDb('academic')
         .prepare(
           `UPDATE schedule_instances
-           SET date = ?, start_time = ?, end_time = ?, actual_teacher_id = ?, note = ?, status = 'adjusted'
+           SET date = ?, start_time = ?, end_time = ?, actual_teacher_id = ?, note = ?, status = 'adjusted',
+               updated_at = datetime('now')
            WHERE id = ?`
         )
         .run(data.date, data.startTime, data.endTime, data.actualTeacherId ?? null, data.note ?? null, id)
@@ -663,12 +762,16 @@ function registerInstanceHandlers(): void {
 
   ipcMain.handle('instances:cancel', (_e, id: number): void => {
     requireRole(['academic'])
-    getDb('academic').prepare(`UPDATE schedule_instances SET status = 'cancelled' WHERE id = ?`).run(id)
+    getDb('academic')
+      .prepare(`UPDATE schedule_instances SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`)
+      .run(id)
   })
 
   ipcMain.handle('instances:restore', (_e, id: number): void => {
     requireRole(['academic'])
-    getDb('academic').prepare(`UPDATE schedule_instances SET status = 'normal' WHERE id = ?`).run(id)
+    getDb('academic')
+      .prepare(`UPDATE schedule_instances SET status = 'normal', updated_at = datetime('now') WHERE id = ?`)
+      .run(id)
   })
 
   ipcMain.handle(
@@ -678,17 +781,19 @@ function registerInstanceHandlers(): void {
       if (!['present', 'leave', 'absent'].includes(data.status)) throw new Error('无效的考勤状态')
       getDb('academic')
         .prepare(
-          `INSERT INTO attendances (schedule_instance_id, student_id, status, note)
-           VALUES (?, ?, ?, ?)
+          `INSERT INTO attendances (schedule_instance_id, student_id, status, note, sync_origin)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(schedule_instance_id, student_id)
-           DO UPDATE SET status = excluded.status, note = excluded.note, created_at = datetime('now')`
+           DO UPDATE SET status = excluded.status, note = excluded.note,
+                         updated_at = datetime('now'), sync_origin = excluded.sync_origin`
         )
-        .run(data.scheduleInstanceId, data.studentId, data.status, data.note ?? null)
+        .run(data.scheduleInstanceId, data.studentId, data.status, data.note ?? null, localCampus())
     }
   )
 
   ipcMain.handle('attendance:remove', (_e, data: { scheduleInstanceId: number; studentId: number }): void => {
     requireRole(['academic'])
+    tombstone('attendances', `${data.scheduleInstanceId}-${data.studentId}`)
     getDb('academic')
       .prepare('DELETE FROM attendances WHERE schedule_instance_id = ? AND student_id = ?')
       .run(data.scheduleInstanceId, data.studentId)
@@ -702,11 +807,12 @@ function registerInstanceHandlers(): void {
     if (!instance) throw new Error('课程实例不存在')
     const result = getDb('academic')
       .prepare(
-        `INSERT INTO attendances (schedule_instance_id, student_id, status)
-         SELECT ?, sc.student_id, 'present' FROM student_courses sc WHERE sc.course_id = ?
-         ON CONFLICT(schedule_instance_id, student_id) DO UPDATE SET status = 'present', created_at = datetime('now')`
+        `INSERT INTO attendances (schedule_instance_id, student_id, status, sync_origin)
+         SELECT ?, sc.student_id, 'present', ? FROM student_courses sc WHERE sc.course_id = ?
+         ON CONFLICT(schedule_instance_id, student_id) DO UPDATE SET status = 'present',
+                         updated_at = datetime('now'), sync_origin = excluded.sync_origin`
       )
-      .run(scheduleInstanceId, instance.course_id)
+      .run(scheduleInstanceId, localCampus(), instance.course_id)
     return result.changes
   })
 }
@@ -1160,10 +1266,10 @@ function registerAssistantHandlers(): void {
       }
       const result = getDb('assistant')
         .prepare(
-          `INSERT INTO lesson_notes (schedule_instance_id, knowledge_points, class_performance, homework, summary)
-           VALUES (?, ?, ?, ?, ?)`
+          `INSERT INTO lesson_notes (schedule_instance_id, knowledge_points, class_performance, homework, summary, sync_origin)
+           VALUES (?, ?, ?, ?, ?, ?)`
         )
-        .run(data.scheduleInstanceId, data.knowledgePoints ?? null, data.classPerformance ?? null, data.homework ?? null, data.summary ?? null)
+        .run(data.scheduleInstanceId, data.knowledgePoints ?? null, data.classPerformance ?? null, data.homework ?? null, data.summary ?? null, localCampus())
       const row = getDb('assistant').prepare('SELECT * FROM lesson_notes WHERE id = ?').get(Number(result.lastInsertRowid)) as LessonNoteRow
       return mapLessonNote(row)
     }
@@ -1180,20 +1286,29 @@ function registerAssistantHandlers(): void {
     const note = getDb('assistant').prepare('SELECT * FROM lesson_notes WHERE id = ?').get(lessonNoteId) as LessonNoteRow | undefined
     if (!note) throw new Error('课程记录不存在')
     const mapped = mapLessonNote(note)
+    // 该课程的下一次上课时间（供短信结尾预告，提升家长预期与转发意愿）
+    const nextInstance = getDb('academic')
+      .prepare(
+        `SELECT si.date, si.start_time, si.end_time
+         FROM schedule_instances si
+         WHERE si.course_id = (SELECT course_id FROM schedule_instances WHERE id = ?)
+           AND si.status != 'cancelled'
+           AND (si.date > ? OR (si.date = ? AND si.start_time > ?))
+         ORDER BY si.date, si.start_time LIMIT 1`
+      )
+      .get(note.schedule_instance_id, mapped.date ?? '0000-00-00', mapped.date ?? '0000-00-00', mapped.startTime ?? '00:00') as
+      | { date: string; start_time: string; end_time: string }
+      | undefined
     const courseText = [mapped.subject, mapped.grade, mapped.className].filter(Boolean).join('')
     const userPrompt = [
-      `课程：${courseText || '（未知课程）'}（${mapped.date ?? '未知日期'} ${mapped.startTime ?? ''}${mapped.startTime && mapped.endTime ? '-' + mapped.endTime : ''}）`,
+      `课程：${courseText || '（未知课程）'}（上课时间 ${mapped.date ?? '未知日期'} ${mapped.startTime ?? ''}${mapped.startTime && mapped.endTime ? '-' + mapped.endTime : ''}）`,
       `知识点：${note.knowledge_points || '（未填写）'}`,
       `课堂表现：${note.class_performance || '（未填写）'}`,
       `当日作业：${note.homework || '（未填写）'}`,
-      `当日总结：${note.summary || '（未填写）'}`
+      `当日总结：${note.summary || '（未填写）'}`,
+      `下次上课：${nextInstance ? `${nextInstance.date} ${nextInstance.start_time}-${nextInstance.end_time}` : '（未提供）'}`
     ].join('\n')
-    const content = await callLLM(
-      'assistant',
-      'sms',
-      '你是一名教培机构的助教老师。根据课程记录，生成一段适合直接发到家长微信群的课程通知，格式参考：【课程通知】今日XX课程总结：知识点：…；课堂表现：…；作业：…；请家长督促完成，谢谢！要求：语气亲切得体、简洁（200 字以内）、不要虚构未提供的信息、只输出通知正文。',
-      userPrompt
-    )
+    const content = await callLLM('assistant', 'sms', SMS_SYSTEM_PROMPT, userPrompt)
     // 保存到历史
     getDb('assistant')
       .prepare('INSERT INTO generated_messages (lesson_note_id, message_content) VALUES (?, ?)')
@@ -1287,6 +1402,70 @@ function registerAgentHandlers(): void {
     async (_e, module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]): Promise<GeneratedContent> => {
       requireRole(['finance'])
       return smartReport(module, columns, rows)
+    }
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 多校区同步（教务 + 助教角色可用；财务数据不参与同步）
+// ---------------------------------------------------------------------------
+
+function registerSyncHandlers(): void {
+  const guardSync = (): void => {
+    requireRole(['academic', 'assistant'])
+  }
+
+  ipcMain.handle('sync:getInfo', (): { campusId: string; campusName: string; history: ReturnType<typeof getSyncHistory> } => {
+    guardSync()
+    const cfg = getCampusInfo()
+    return { campusId: cfg.campusId, campusName: cfg.campusName, history: getSyncHistory() }
+  })
+
+  ipcMain.handle('sync:saveCampusName', (_e, name: string): void => {
+    guardSync()
+    setCampusName(name)
+  })
+
+  ipcMain.handle(
+    'sync:exportPackage',
+    async (): Promise<{ success: boolean; canceled?: boolean; path?: string; counts?: number; error?: string }> => {
+      guardSync()
+      const pkg = buildSyncPackage()
+      const cfg = getCampusInfo()
+      const { canceled, filePath } = await dialog.showSaveDialog({
+        title: '导出多校区同步包',
+        defaultPath: `Vlearn_同步包_${cfg.campusName || '校区'}_${format(new Date(), 'yyyy-MM-dd')}.vsync.json`,
+        filters: [{ name: 'Vlearn 同步包', extensions: ['json'] }]
+      })
+      if (canceled || !filePath) return { success: false, canceled: true }
+      fs.writeFileSync(filePath, JSON.stringify(pkg), 'utf8')
+      recordExportHistory(pkg, filePath)
+      return { success: true, path: filePath, counts: packageRowCount(pkg) }
+    }
+  )
+
+  ipcMain.handle(
+    'sync:importPackage',
+    async (): Promise<{ success: boolean; canceled?: boolean; stats?: SyncStats; error?: string }> => {
+      guardSync()
+      const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: '选择多校区同步包',
+        filters: [{ name: 'Vlearn 同步包', extensions: ['json'] }],
+        properties: ['openFile']
+      })
+      if (canceled || filePaths.length === 0) return { success: false, canceled: true }
+      let pkg: SyncPackage
+      try {
+        const raw = JSON.parse(fs.readFileSync(filePaths[0], 'utf8')) as SyncPackage
+        if (raw.version !== 3 || !raw.academic?.tables || !raw.assistant?.tables) {
+          throw new Error('文件格式不正确（不是 Vlearn v3 同步包）')
+        }
+        pkg = raw
+      } catch (err) {
+        return { success: false, error: `同步包解析失败：${(err as Error).message}` }
+      }
+      const stats = mergeSyncPackage(pkg)
+      return { success: true, stats }
     }
   )
 }
@@ -1468,5 +1647,6 @@ export function registerIpcHandlers(): void {
   registerFinanceHandlers()
   registerAssistantHandlers()
   registerAgentHandlers()
+  registerSyncHandlers()
   registerSettingsHandlers()
 }

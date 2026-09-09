@@ -18,6 +18,7 @@ import type {
 } from '../src/types'
 import { AINotConfiguredError, callLLM, isAIConfigured } from './ai'
 import { getDb, getSettingValue, Role } from './db'
+import { REPORT_SYSTEM_PROMPT, TREND_SYSTEM_PROMPT, VOUCHER_SYSTEM_PROMPT } from './prompts'
 
 // ---------------------------------------------------------------------------
 // 通用工具
@@ -436,7 +437,7 @@ export async function generateReport(kind: 'week' | 'month'): Promise<GeneratedC
     const content = await callLLM(
       'academic',
       'report',
-      '你是一名教培机构的教务主任，根据给定的统计数据撰写一份简洁、专业的教务周报/月报，使用中文，包含基本情况、数据亮点与工作建议，300 字以内。',
+      REPORT_SYSTEM_PROMPT,
       `${title}数据（${dataText}）`
     )
     return { content, usedAi: true }
@@ -676,7 +677,7 @@ export async function trendAnalysis(): Promise<GeneratedContent> {
     const content = await callLLM(
       'finance',
       'trend',
-      '你是一名教培机构的财务分析师，根据给出的月度收入/支出/盈亏数据，输出 300 字以内的中文趋势分析：概括现状、指出值得关注的风险点、给出 2-3 条经营建议。',
+      TREND_SYSTEM_PROMPT,
       `历史月度数据：\n${dataText || '无'}\n\n系统预测：\n${projectionText}`
     )
     return { content, usedAi: true }
@@ -712,12 +713,7 @@ export async function smartReport(
 
   if (isAIConfigured('finance')) {
     try {
-      const note = await callLLM(
-        'finance',
-        'voucher',
-        '你是一名教培机构财务，基于给定报表数据，用中文给出 100 字以内的简要点评（金额核对提示或异常提醒）。',
-        lines.join('\n')
-      )
+      const note = await callLLM('finance', 'voucher', VOUCHER_SYSTEM_PROMPT, lines.join('\n'))
       content += `\n\n【智能点评】${note}`
       return { content, usedAi: true }
     } catch (err) {

@@ -162,6 +162,12 @@ const api: VlearnApi = {
   smartReport: (module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]) =>
     ipcRenderer.invoke('agent:smartReport', module, columns, rows),
 
+  // ---------- 多校区同步 ----------
+  getSyncInfo: () => ipcRenderer.invoke('sync:getInfo'),
+  saveCampusName: (name: string) => ipcRenderer.invoke('sync:saveCampusName', name),
+  syncExport: () => ipcRenderer.invoke('sync:exportPackage'),
+  syncImport: () => ipcRenderer.invoke('sync:importPackage'),
+
   // ---------- 设置 / 备份 / 导出 ----------
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (data: RoleSettings) => ipcRenderer.invoke('settings:save', data),

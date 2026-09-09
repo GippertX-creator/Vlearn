@@ -1,6 +1,6 @@
 {
   "name": "vlearn",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Vlearn 教培机构教务与财务管理系统（本地桌面应用，数据存储于 SQLite）",
   "main": "out/main/index.js",
   "author": "Vlearn",

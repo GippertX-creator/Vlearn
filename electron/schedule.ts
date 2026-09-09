@@ -21,6 +21,7 @@ function toDateFnsDay(weekday: number): Day {
  * @param rules 时间规则数组
  * @param fromDate 起始日期（含），从该日起找每个规则的下一次上课日
  * @param weeks 生成周数
+ * @param syncOrigin 校区标识（多校区同步用，可选）
  * @returns 实际插入的实例数量
  */
 export function generateInstances(
@@ -28,11 +29,12 @@ export function generateInstances(
   courseId: number,
   rules: ScheduleRule[],
   fromDate: Date,
-  weeks: number
+  weeks: number,
+  syncOrigin?: string
 ): number {
   const insert = database.prepare(`
-    INSERT INTO schedule_instances (course_id, date, start_time, end_time, status)
-    VALUES (?, ?, ?, ?, 'normal')
+    INSERT INTO schedule_instances (course_id, date, start_time, end_time, status, sync_origin)
+    VALUES (?, ?, ?, ?, 'normal', ?)
   `)
   const exists = database.prepare(`
     SELECT 1 FROM schedule_instances
@@ -50,7 +52,7 @@ export function generateInstances(
         const date = addWeeks(first, w)
         const dateStr = format(date, 'yyyy-MM-dd')
         if (exists.get(courseId, dateStr, rule.start, rule.end)) continue
-        insert.run(courseId, dateStr, rule.start, rule.end)
+        insert.run(courseId, dateStr, rule.start, rule.end, syncOrigin ?? null)
         count++
       }
     }

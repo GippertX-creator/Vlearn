@@ -109,7 +109,56 @@ function openRoleDb(role: Role): void {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   migrateSchema(role, db)
+  migrateSyncColumns(role, db)
   dbs[role] = db
+}
+
+/** 列不存在时追加（幂等，用于 v3 同步字段的平滑升级） */
+function addColumnIfMissing(db: Database.Database, table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info("${table}")`).all() as { name: string }[]
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE "${table}" ADD COLUMN ${column} ${ddl}`)
+  }
+}
+
+/**
+ * 为同步表补充 v3 同步元数据列：
+ * - updated_at：最后修改时间（跨校区合并时"最近修改优先"）
+ * - sync_origin：数据来源校区编号（区分不同校区各自创建的行）
+ * - sync_remote_id：行在来源校区的原始 id（导入发生 id 冲突重映射后仍可定位原行）
+ */
+function migrateSyncColumns(role: Role, db: Database.Database): void {
+  const tsDdl = `TEXT DEFAULT (datetime('now'))`
+  const originDdl = 'TEXT'
+  const remoteDdl = 'INTEGER'
+  if (role === 'academic') {
+    for (const t of ['teachers', 'students', 'courses', 'teacher_courses', 'student_courses', 'schedule_instances', 'attendances']) {
+      if (t !== 'courses') addColumnIfMissing(db, t, 'updated_at', tsDdl)
+      addColumnIfMissing(db, t, 'sync_origin', originDdl)
+      addColumnIfMissing(db, t, 'sync_remote_id', remoteDdl)
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_tombstones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        table_name TEXT NOT NULL,
+        row_id TEXT NOT NULL,          -- 单主键表为 id；复合主键表为 "a-b"
+        deleted_at TEXT NOT NULL,
+        sync_origin TEXT NOT NULL
+      );
+    `)
+  } else if (role === 'assistant') {
+    addColumnIfMissing(db, 'lesson_notes', 'sync_origin', originDdl)
+    addColumnIfMissing(db, 'lesson_notes', 'sync_remote_id', remoteDdl)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_tombstones (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        table_name TEXT NOT NULL,
+        row_id TEXT NOT NULL,
+        deleted_at TEXT NOT NULL,
+        sync_origin TEXT NOT NULL
+      );
+    `)
+  }
 }
 
 /** 各角色数据库建表（幂等） */

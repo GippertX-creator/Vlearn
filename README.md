@@ -4,6 +4,8 @@
 
 **v2 特性**：教务 / 财务 / 助教三种角色，各自使用**独立的物理数据库**（数据隔离），内置教务 Agent 与财务 Agent（排课冲突检测、考勤异常提醒、对账检查、异常交易检测、AI 报告等），助教模块支持课程内容记录与基于外部大模型的微信群短信生成。
 
+**v3 特性**：Agent 提示词集中管理与调优（微信群短信语言优化 + 下次上课预告）；**多校区信息同步**（人工同步包：全量快照 + 删除墓碑 + 跨校区 id 冲突自动重映射，财务数据与密钥不参与同步）。
+
 > 面向普通用户的操作指南见 [使用说明书.md](./使用说明书.md)。
 
 ## 技术栈
@@ -27,6 +29,8 @@
 │   ├── db.ts                    # 三库管理（vlearn_academic/finance/assistant.db）、旧库自动迁移
 │   ├── auth.ts                  # 角色会话（登录/登出/密码），auth.json 持久化，requireRole 权限校验
 │   ├── ai.ts                    # OpenAI 兼容大模型客户端（30s 超时、错误归一化）
+│   ├── prompts.ts               # 全部生成文本的系统提示词（集中调优）
+│   ├── sync.ts                  # 多校区同步引擎（快照导出/合并导入/墓碑/重映射）
 │   ├── agent.ts                 # 教务/财务 Agent 逻辑（本地规则检测 + 可选 LLM 文本生成）
 │   ├── schedule.ts              # 排课生成算法
 │   ├── ipcHandlers.ts           # 全部 IPC 处理器（每个通道严格角色校验 + 跨库只读/清理）
@@ -40,7 +44,8 @@
 │   ├── pages/                   # LoginPage、CalendarPage、Students/TeachersPage、
 │   │                            # ReportsCenterPage（教务报告）、SettingsPage（按角色分节）、
 │   │                            # FinanceDashboard、CourseFees、Student/TeacherPayments、Reports、
-│   │                            # LessonNotesPage、HistoryMessagesPage（助教）
+│   │                            # LessonNotesPage、HistoryMessagesPage（助教）、
+│   │                            # SyncPage（多校区同步）
 │   └── components/              # AgentSidebar、LessonNoteEditorModal、InstanceDetailModal、
 │                                # CourseManagerModal、PageToolbar、ExportExcelButton 等
 ├── scripts/rebuild-native.js    # postinstall：better-sqlite3 → Electron ABI（支持镜像）
@@ -106,6 +111,14 @@ npm run dist       # 打包当前平台安装包（release/）
 | 助教 | `assistant:getLessonNote` `assistant:saveLessonNote` `assistant:listLessonNotes` `assistant:generateSms` `assistant:listMessages` `assistant:deleteMessage` | 仅助教 |
 | Agent | `agent:getAlerts`（教务/财务）`agent:checkCourseConflict` `agent:checkInstanceConflict` `agent:suggestSlots` `agent:checkDuplicateName` `agent:generateReport`（教务）`agent:reconcile` `agent:checkPaymentAnomaly` `agent:trendAnalysis` `agent:smartReport`（财务） | 按角色 |
 | 设置/备份/导出 | `settings:get` `settings:save`（按角色分节）`app:getVersion` `backup:create` `backup:restore` `export:excel` | 任意已登录角色 |
+| 多校区同步 | `sync:getInfo` `sync:saveCampusName` `sync:exportPackage` `sync:importPackage` | 教务/助教 |
+
+### 多校区同步（v3）
+
+- **模型**：人工同步包——导出 JSON 文件 → 微信/邮件发送 → 对方导入；每次导出都是**全量快照 + 删除墓碑**，导入幂等、顺序无关、丢包自愈。
+- **范围**：教务库（课程/老师/学生/排课/考勤/设置）+ 助教库（lesson_notes）；财务库、`password_hash`、`ai_api_key` 永不入包。
+- **合并规则**（`electron/sync.ts`）：同来源同行为 LWW（`updated_at` 大者胜）；两校区同 id 不同行（以 `sync_origin` 区分）自动为新行分配新 id 并重建外键引用（`sync_remote_id` 记录来源 id）；墓碑在来源一致且晚于本地修改时级联删除并继续传播。
+- 同步元数据列（`updated_at`/`sync_origin`/`sync_remote_id`）通过幂等 ALTER 追加，旧库升级无损；所有写路径维护时间戳与墓碑。
 
 ### Agent 设计原则
 
@@ -133,7 +146,7 @@ npm run dist       # 打包当前平台安装包（release/）
 ## 测试
 
 ```bash
-npm run smoke      # 迁移验证 + 三角色登录/越权拦截 + 教务/财务/助教全流程 + Agent 能力（约 60 项断言）
+npm run smoke      # 迁移验证 + 三角色登录/越权拦截 + 全流程 + Agent + 多校区同步（73 项断言）
 npm run smoke:ui   # 登录页渲染、三个角色登录后主界面渲染、无渲染进程错误
 ```
 
@@ -162,3 +175,4 @@ npm run smoke:ui   # 登录页渲染、三个角色登录后主界面渲染、�
 | 忘记角色密码 | 见"安全说明"最后一条 |
 | 助教"生成微信群短信"报错 | 未配置 API 或网络不通：助教设置 → 大模型 API 配置 |
 | 报告显示"系统模板" | 未配置大模型 API 时的正常回退，配置后自动变为 AI 润色 |
+| 多校区怎么共享数据 | 菜单"多校区同步"→ 导出同步包 → 微信发对方 → 对方导入（财务数据不参与同步） |

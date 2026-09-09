@@ -13,6 +13,7 @@ import { initAuth } from './auth'
 import { initDatabases } from './db'
 import { registerIpcHandlers } from './ipcHandlers'
 import { runSmokeTest, runUiSmokeTest } from './smoke'
+import { initSync } from './sync'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
 const isUiSmokeTest = process.argv.includes('--smoke-ui')
@@ -56,9 +57,11 @@ app.whenReady().then(() => {
     smokeDir = mkdtempSync(join(tmpdir(), 'vlearn-smoke-'))
     initDatabases(smokeDir)
     initAuth(smokeDir)
+    initSync(smokeDir)
   } else {
     initDatabases()
     initAuth(app.getPath('userData'))
+    initSync(app.getPath('userData'))
   }
   registerIpcHandlers()
 

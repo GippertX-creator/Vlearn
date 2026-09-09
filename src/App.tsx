@@ -8,6 +8,7 @@ import {
   AccountBookOutlined,
   BarChartOutlined,
   CalendarOutlined,
+  CloudSyncOutlined,
   DashboardOutlined,
   FileTextOutlined,
   IdcardOutlined,
@@ -34,6 +35,7 @@ import ReportsCenterPage from './pages/ReportsCenterPage'
 import ReportsPage from './pages/ReportsPage'
 import SettingsPage from './pages/SettingsPage'
 import StudentPaymentsPage from './pages/StudentPaymentsPage'
+import SyncPage from './pages/SyncPage'
 import StudentsPage from './pages/StudentsPage'
 import TeacherPaymentsPage from './pages/TeacherPaymentsPage'
 import TeachersPage from './pages/TeachersPage'
@@ -49,6 +51,7 @@ const MENUS: Record<Role, { key: string; icon: JSX.Element; label: string }[]> =
     { key: 'students', icon: <TeamOutlined />, label: '学生管理' },
     { key: 'teachers', icon: <IdcardOutlined />, label: '老师管理' },
     { key: 'reports', icon: <FileTextOutlined />, label: '报告中心' },
+    { key: 'sync', icon: <CloudSyncOutlined />, label: '多校区同步' },
     { key: 'settings', icon: <SettingOutlined />, label: '系统设置' }
   ],
   finance: [
@@ -63,6 +66,7 @@ const MENUS: Record<Role, { key: string; icon: JSX.Element; label: string }[]> =
     { key: 'calendar', icon: <CalendarOutlined />, label: '课程日历' },
     { key: 'notes', icon: <AccountBookOutlined />, label: '课程内容记录' },
     { key: 'messages', icon: <MessageOutlined />, label: '历史消息' },
+    { key: 'sync', icon: <CloudSyncOutlined />, label: '多校区同步' },
     { key: 'settings', icon: <SettingOutlined />, label: '系统设置' }
   ]
 }
@@ -153,6 +157,8 @@ export default function App(): JSX.Element {
           return <TeachersPage />
         case 'reports':
           return <ReportsCenterPage />
+        case 'sync':
+          return <SyncPage />
         case 'settings':
           return <SettingsPage />
       }
@@ -180,6 +186,8 @@ export default function App(): JSX.Element {
         return <LessonNotesPage />
       case 'messages':
         return <HistoryMessagesPage />
+      case 'sync':
+        return <SyncPage />
       case 'settings':
         return <SettingsPage />
     }

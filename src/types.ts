@@ -328,6 +328,32 @@ export interface AssistantSettings {
 export type RoleSettings = AcademicSettings | FinanceSettings | AssistantSettings
 
 // ---------------------------------------------------------------------------
+// 多校区同步
+// ---------------------------------------------------------------------------
+
+export interface SyncHistoryEntry {
+  type: 'export' | 'import'
+  ts: string
+  campusName: string
+  counts?: string
+  path?: string
+}
+
+export interface SyncStats {
+  added: number
+  updated: number
+  deleted: number
+  remapped: number
+  fromCampus: string
+}
+
+export interface SyncInfo {
+  campusId: string
+  campusName: string
+  history: SyncHistoryEntry[]
+}
+
+// ---------------------------------------------------------------------------
 // 导出与备份
 // ---------------------------------------------------------------------------
 
@@ -524,6 +550,14 @@ export interface VlearnApi {
   trendAnalysis(): Promise<GeneratedContent>
   /** 智能报表/凭证生成（财务，基于当前筛选结果） */
   smartReport(module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]): Promise<GeneratedContent>
+
+  // ---------- 多校区同步（教务/助教角色） ----------
+  getSyncInfo(): Promise<SyncInfo>
+  saveCampusName(name: string): Promise<void>
+  /** 导出同步包（保存对话框），返回包内记录数 */
+  syncExport(): Promise<{ success: boolean; canceled?: boolean; path?: string; counts?: number; error?: string }>
+  /** 导入并合并同步包（打开对话框） */
+  syncImport(): Promise<{ success: boolean; canceled?: boolean; stats?: SyncStats; error?: string }>
 
   // ---------- 设置 / 备份 / 导出 ----------
   getSettings(): Promise<RoleSettings>

@@ -17,6 +17,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { buildWorkbook } from './excelExport'
 import { getDb, getMigrationError, initDatabases, INITIAL_PASSWORDS, Role } from './db'
+import { buildSyncPackage, getCampusId, initSync, mergeSyncPackage, setCampusName, SyncPackage } from './sync'
 
 const failures: string[] = []
 
@@ -280,6 +281,94 @@ export async function runSmokeTest(mainDir: string): Promise<void> {
   const version = await call<string>(`window.api.getAppVersion()`)
   assert(!!version && version !== '0.0.0', '应用版本号可读')
 
+  // ---------- 多校区同步 ----------
+  console.log('\n[7] 多校区同步')
+  // 真实时序：先创建"待删除学生"并导出包1（此时该生存在）→ 再删除并导出包2（含墓碑）
+  await call(`window.api.logout()`)
+  await call(`window.api.login('academic', 'admin123')`)
+  await call(
+    `window.api.createStudent({ name: '待删除学生', schoolClass: null, note: null, courseIds: [${course.id}] })`
+  )
+  const campusA = getCampusId()
+  const pkg1 = buildSyncPackage()
+  await call(`window.api.getStudents().then((ss) => window.api.deleteStudent(ss.find((s) => s.name === '待删除学生').id))`)
+  const pkg = buildSyncPackage()
+  await call(`window.api.logout()`)
+
+  const tombCount = (pkg.academic.tombstones as { table_name: string }[]).filter((t) => t.table_name === 'students').length
+  assert(tombCount >= 1, `删除墓碑已记录（students ${tombCount} 条）`)
+  const settingsRows = pkg.academic.tables.settings as { key: string }[]
+  assert(!settingsRows.some((r) => r.key === 'password_hash' || r.key === 'ai_api_key'), '同步包排除密码与 API 密钥')
+  assert(pkg.version === 3 && pkg.academic.tables.courses.length >= 1, '同步包结构完整')
+
+  // 校区 B：全新数据目录，先导入包1（含待删除学生），再导入包2（含墓碑）
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'vlearn-campus-b-'))
+  initSync(dirB)
+  setCampusName('B校区')
+  initDatabases(dirB)
+  const stats = mergeSyncPackage(pkg1)
+  assert(stats.added >= 15, `B 校区导入：新增 ${stats.added} 条`)
+  assert(stats.remapped === 0, 'B 校区为空库时无编号冲突')
+  assert(!!getDb('academic').prepare('SELECT 1 FROM students WHERE name = ?').get('待删除学生'), '包1：B 校区收到待删除学生')
+  mergeSyncPackage(pkg)
+  assert(!getDb('academic').prepare('SELECT 1 FROM students WHERE name = ?').get('待删除学生'), '包2：删除通过墓碑传播到 B 校区')
+  const bStudents = (getDb('academic').prepare('SELECT COUNT(*) AS c FROM students').get() as { c: number }).c
+  assert(bStudents === pkg.academic.tables.students.length, 'B 校区学生数与 A 最新快照一致')
+  const bNotes = (getDb('assistant').prepare('SELECT COUNT(*) AS c FROM lesson_notes').get() as { c: number }).c
+  assert(bNotes === pkg.assistant.tables.lesson_notes.length, '助教课程记录已同步')
+
+  // LWW：B 本地旧时间戳修改 → 远端新包覆盖；B 本地新时间戳修改 → 保留本地
+  const targetStudent = (pkg.academic.tables.students as Record<string, unknown>[]).find((s) => s.name === '小明') as
+    | { id: number }
+    | undefined
+  assert(!!targetStudent, '找到目标学生')
+  const sid = targetStudent!.id
+  getDb('academic').prepare(`UPDATE students SET name = '本地旧改', updated_at = '2020-01-01 00:00:00' WHERE id = ?`).run(sid)
+  const pkg2 = JSON.parse(JSON.stringify(pkg)) as SyncPackage
+  const row = (pkg2.academic.tables.students as Record<string, unknown>[]).find((s) => s.id === sid)!
+  row.name = '小明改'
+  row.updated_at = '2026-01-01 00:00:00'
+  mergeSyncPackage(pkg2)
+  let bName = (getDb('academic').prepare('SELECT name FROM students WHERE id = ?').get(sid) as { name: string }).name
+  assert(bName === '小明改', 'LWW：远端较新修改覆盖本地旧修改')
+  getDb('academic').prepare(`UPDATE students SET name = '本地新改', updated_at = datetime('now') WHERE id = ?`).run(sid)
+  mergeSyncPackage(pkg2)
+  bName = (getDb('academic').prepare('SELECT name FROM students WHERE id = ?').get(sid) as { name: string }).name
+  assert(bName === '本地新改', 'LWW：本地较新修改不被覆盖')
+
+  // 编号冲突重映射：B 创建自己的老师（占 id 2），A 包中也带老师 id 2 → 自动分配新编号并重建引用
+  getDb('academic').prepare(`INSERT INTO teachers (id, name, note, sync_origin) VALUES (2, 'B校老师', null, ?)`).run(getCampusId())
+  ;(pkg2.academic.tables.teachers as Record<string, unknown>[]).push({
+    id: 2,
+    name: 'A校二老师',
+    note: null,
+    created_at: '2026-01-01 00:00:00',
+    updated_at: '2026-01-01 00:00:00',
+    sync_origin: campusA,
+    sync_remote_id: null
+  })
+  ;(pkg2.academic.tables.teacher_courses as Record<string, unknown>[]).push({
+    teacher_id: 2,
+    course_id: course.id,
+    updated_at: '2026-01-01 00:00:00',
+    sync_origin: campusA,
+    sync_remote_id: null
+  })
+  const stats2 = mergeSyncPackage(pkg2)
+  assert(stats2.remapped >= 1, `编号冲突自动重映射（${stats2.remapped} 条）`)
+  const bTeachers = getDb('academic').prepare('SELECT id, name, sync_origin FROM teachers ORDER BY id').all() as {
+    id: number
+    name: string
+    sync_origin: string
+  }[]
+  assert(bTeachers.some((t) => t.name === 'B校老师' && t.sync_origin !== campusA), 'B 校自己的老师保留')
+  const remapped = bTeachers.find((t) => t.name === 'A校二老师')
+  assert(!!remapped && remapped.id !== 2, 'A 校同号老师被分配新编号')
+  const rel = getDb('academic')
+    .prepare('SELECT 1 FROM teacher_courses WHERE teacher_id = ? AND course_id = ?')
+    .get(remapped!.id, course.id)
+  assert(!!rel, '授课关联随重映射重建')
+
   win.destroy()
 
   console.log('\n----------------------------------------')
@@ -356,6 +445,8 @@ export async function runUiSmokeTest(): Promise<void> {
   await shot('03-教务-学生管理.png')
   await clickMenu('系统设置')
   await shot('04-教务-系统设置.png')
+  await clickMenu('多校区同步')
+  await shot('05-教务-多校区同步.png')
 
   // 3) 财务主界面
   await loginAs('finance')

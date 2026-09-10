@@ -232,7 +232,36 @@ function migrateSchema(role: Role, db: Database.Database): void {
         FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
       );
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+
+      -- 校区（v4 教室资源管理；多校区同步不涉及，各校区自管）
+      CREATE TABLE IF NOT EXISTS campuses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        address TEXT,
+        note TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      -- 教室（v4）
+      CREATE TABLE IF NOT EXISTS classrooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campus_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        capacity INTEGER,
+        type TEXT NOT NULL DEFAULT '普通',       -- 普通/多媒体/实验室等
+        note TEXT,
+        device_info TEXT,                        -- 设备信息
+        status TEXT DEFAULT 'available',         -- available / maintenance / disabled
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (campus_id) REFERENCES campuses(id) ON DELETE CASCADE
+      );
     `)
+    // v4 新列（幂等追加，旧库无损升级）
+    addColumnIfMissing(db, 'courses', 'default_classroom_id', 'INTEGER')
+    addColumnIfMissing(db, 'schedule_instances', 'classroom_id', 'INTEGER')
+    addColumnIfMissing(db, 'teachers', 'default_rate_per_lesson', 'REAL DEFAULT 0')
+    addColumnIfMissing(db, 'schedule_instances', 'actual_rate', 'REAL')
+    addColumnIfMissing(db, 'student_courses', 'status', `TEXT DEFAULT 'active'`)
   } else if (role === 'finance') {
     db.exec(`
       -- 财务库不再声明指向教务库的外键（SQLite 外键无法跨库），
@@ -263,7 +292,35 @@ function migrateSchema(role: Role, db: Database.Database): void {
       );
       CREATE INDEX IF NOT EXISTS idx_teacher_payments_date ON teacher_payments(payment_date);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+
+      -- 学生-课程个性化费用（v4：单价/折扣类型/赠送课时，仅财务可见）
+      CREATE TABLE IF NOT EXISTS student_course_fees (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER NOT NULL,
+        course_id INTEGER NOT NULL,
+        unit_price REAL NOT NULL DEFAULT 0,
+        discount_type TEXT NOT NULL DEFAULT 'none',  -- none/old_student/group_buy/gift/other
+        free_lessons INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(student_id, course_id)
+      );
+      -- 财务操作审计日志（v4：所有费用修改记录前后值）
+      CREATE TABLE IF NOT EXISTS finance_audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id INTEGER NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
     `)
+    // v4 新列（幂等追加）
+    addColumnIfMissing(db, 'student_payments', 'is_locked', 'INTEGER DEFAULT 0')
+    addColumnIfMissing(db, 'teacher_payments', 'rate_source', `TEXT DEFAULT 'course'`)
   } else {
     db.exec(`
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);

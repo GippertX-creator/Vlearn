@@ -53,6 +53,9 @@ export interface Course {
   fee: number
   /** 单次课酬标准（仅财务角色可见/可编辑） */
   payPerSession: number
+  /** 默认教室（v4） */
+  defaultClassroomId: number | null
+  defaultClassroomName?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -64,6 +67,8 @@ export interface Teacher {
   note: string | null
   courseIds: number[]
   courseLabels: string[]
+  /** 默认课酬（元/次，仅财务可见；其余角色 IPC 边界清零） */
+  defaultRatePerLesson: number
 }
 
 /** 老师详情（含授课统计） */
@@ -121,6 +126,9 @@ export interface ScheduleInstance {
   grade?: string
   className?: string
   defaultTeacherName?: string | null
+  /** 实际使用教室（v4；null 继承课程默认教室） */
+  classroomId?: number | null
+  classroomName?: string | null
 }
 
 /** 课程实例详情弹窗数据 */
@@ -132,6 +140,8 @@ export interface InstanceDetail {
     name: string
     schoolClass: string | null
     attendanceStatus: AttendanceStatus | null
+    /** 学生在该课程的状态（v4：active/paused/refunded/completed/transferred） */
+    courseStatus: string
   }[]
 }
 
@@ -148,6 +158,8 @@ export interface StudentPayment {
   paymentMethod: string
   paymentDate: string
   note: string | null
+  /** 是否锁定（v4：已实缴/手动锁定则不被自动重算） */
+  isLocked: number
   studentName?: string
   courseLabel?: string
 }
@@ -160,6 +172,8 @@ export interface TeacherPayment {
   amountPaid: number
   paymentDate: string
   note: string | null
+  /** 课酬标准来源（v4：instance 实例覆盖 / teacher 老师默认 / course 课程标准） */
+  rateSource?: string
   teacherName?: string
   instanceLabel?: string
 }
@@ -229,10 +243,10 @@ export interface AgentAlert {
   createdAt: string
 }
 
-/** 排课冲突项 */
+/** 排课冲突项（v4 起支持教室冲突） */
 export interface ConflictItem {
-  type: 'teacher' | 'student'
-  /** 冲突对象（老师/学生姓名） */
+  type: 'teacher' | 'student' | 'classroom'
+  /** 冲突对象（老师/学生姓名/教室名） */
   who: string
   /** 冲突的课程标签 */
   courseLabel: string
@@ -347,6 +361,114 @@ export interface SyncStats {
   fromCampus: string
 }
 
+/** 学生个性化课程费用（v4，仅财务可见） */
+export interface StudentCourseFee {
+  id: number
+  studentId: number
+  courseId: number
+  /** 该学生此课程的单价（元/次）；未设置为 0（回退课程标准费用） */
+  unitPrice: number
+  /** 折扣类型：none/old_student/group_buy/gift/other */
+  discountType: string
+  /** 赠送课时数（免费次数） */
+  freeLessons: number
+  note: string | null
+  studentName?: string
+  courseLabel?: string
+}
+
+/** 学生-课程状态（v4） */
+export type StudentCourseStatus = 'active' | 'paused' | 'refunded' | 'completed' | 'transferred'
+
+/** 校区（v4） */
+export interface Campus {
+  id: number
+  name: string
+  address: string | null
+  note: string | null
+}
+
+/** 教室（v4） */
+export interface Classroom {
+  id: number
+  campusId: number
+  campusName: string
+  name: string
+  capacity: number | null
+  type: string
+  note: string | null
+  deviceInfo: string | null
+  status: 'available' | 'maintenance' | 'disabled'
+}
+
+/** 教室利用率（v4） */
+export interface ClassroomUtilization {
+  id: number
+  name: string
+  campusId: number
+  campusName: string
+  status: string
+  scheduledMinutes: number
+  availableMinutes: number
+  /** 利用率百分比（0-100，保留 1 位小数） */
+  rate: number
+}
+
+/** 经营分析数据（v4） */
+export interface AnalyticsData {
+  trend: { bucket: string; income: number; expense: number; profit: number }[]
+  incomeBySubject: { name: string; value: number }[]
+  incomeByMethod: { name: string; value: number }[]
+  expenseByTeacher: { name: string; value: number }[]
+  expenseByCourse: { name: string; value: number }[]
+}
+
+/** 老师简报数据（v4） */
+export interface TeacherBriefData {
+  teacher: { id: number; name: string; note: string | null }
+  courses: string[]
+  instances: { date: string; startTime: string; endTime: string; courseLabel: string; classroomName: string | null }[]
+  students: {
+    name: string
+    schoolClass: string | null
+    courseLabel: string
+    stats: { present: number; leave: number; absent: number }
+  }[]
+  /** 课酬汇总（仅勾选包含时返回，不含任何学生缴费信息） */
+  compensation: { due: number; paid: number } | null
+}
+
+/** 财务操作审计日志（v4） */
+export interface AuditLogEntry {
+  id: number
+  action: string
+  operator: string
+  targetType: string
+  targetId: number
+  oldValue: string | null
+  newValue: string | null
+  createdAt: string
+}
+
+/** 定时备份配置与系统通知（v4） */
+export interface BackupConfigInfo {
+  enabled: boolean
+  dir: string
+  day: number
+  hour: number
+  keep: number
+  lastBackupTime: string | null
+  lastBackupStatus: string | null
+}
+
+export interface SystemNotification {
+  id: string
+  ts: string
+  level: 'success' | 'error' | 'info'
+  title: string
+  detail: string
+}
+
 export interface SyncInfo {
   campusId: string
   campusName: string
@@ -398,6 +520,7 @@ export interface VlearnApi {
     className: string
     defaultTeacherId: number | null
     scheduleRule: ScheduleRule[]
+    defaultClassroomId?: number | null
   }): Promise<Course>
   updateCourse(
     id: number,
@@ -407,6 +530,7 @@ export interface VlearnApi {
       className: string
       defaultTeacherId: number | null
       scheduleRule: ScheduleRule[]
+      defaultClassroomId?: number | null
     }
   ): Promise<Course>
   deleteCourse(id: number): Promise<void>
@@ -433,6 +557,7 @@ export interface VlearnApi {
       endTime: string
       actualTeacherId: number | null
       note: string | null
+      classroomId?: number | null
     }
   ): Promise<ScheduleInstance>
   cancelInstance(id: number): Promise<void>
@@ -522,6 +647,7 @@ export interface VlearnApi {
     courseId: number | null
     defaultTeacherId: number | null
     scheduleRule: ScheduleRule[]
+    defaultClassroomId?: number | null
   }): Promise<ConflictItem[]>
   /** 单次调课冲突检测（教务） */
   checkInstanceConflict(data: {
@@ -530,6 +656,7 @@ export interface VlearnApi {
     startTime: string
     endTime: string
     actualTeacherId: number | null
+    classroomId?: number | null
   }): Promise<ConflictItem[]>
   /** 调课替补时间段建议（教务，返回 3 个） */
   suggestSlots(instanceId: number): Promise<SlotSuggestion[]>
@@ -550,6 +677,71 @@ export interface VlearnApi {
   trendAnalysis(): Promise<GeneratedContent>
   /** 智能报表/凭证生成（财务，基于当前筛选结果） */
   smartReport(module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]): Promise<GeneratedContent>
+
+  // ---------- 财务 v4：个性化费用 / 状态 / 审计 / 分析 / 简报 ----------
+  getStudentCourseFees(): Promise<StudentCourseFee[]>
+  upsertStudentCourseFee(data: {
+    studentId: number
+    courseId: number
+    unitPrice: number
+    discountType: string
+    freeLessons: number
+    note: string | null
+  }): Promise<void>
+  deleteStudentCourseFee(studentId: number, courseId: number): Promise<void>
+  updateStudentPaymentLock(id: number, isLocked: boolean): Promise<void>
+  updateTeacherRate(teacherId: number, rate: number): Promise<void>
+  updateInstanceRate(instanceId: number, rate: number | null): Promise<void>
+  updateStudentCourseStatus(studentId: number, courseId: number, status: 'active' | 'paused' | 'completed'): Promise<void>
+  /** 退费：生成负实缴记录并将课程状态置为 refunded，返回退费计算明细 */
+  refundStudentCourse(studentId: number, courseId: number): Promise<{ refund: number; consumed: number; paid: number }>
+  /** 转课：原课结清（正=补缴/负=退还）并置 transferred，新课程自动建立关联 */
+  transferStudentCourse(studentId: number, fromCourseId: number, toCourseId: number, note: string | null): Promise<{ balance: number }>
+  getAuditLogs(filters?: { action?: string; limit?: number }): Promise<AuditLogEntry[]>
+  getAnalytics(opts: { granularity: 'month' | 'quarter' | 'year'; start: string; end: string }): Promise<AnalyticsData>
+  getTeacherBriefData(opts: {
+    teacherId: number
+    start: string
+    end: string
+    includeCompensation: boolean
+  }): Promise<TeacherBriefData>
+  /** 简报导出 PDF（html 由渲染层生成） */
+  briefExportPdf(html: string): Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }>
+
+  // ---------- 校区与教室资源（写仅教务） ----------
+  getCampuses(): Promise<Campus[]>
+  createCampus(data: { name: string; address: string | null; note: string | null }): Promise<Campus>
+  updateCampus(id: number, data: { name: string; address: string | null; note: string | null }): Promise<Campus>
+  deleteCampus(id: number): Promise<void>
+  getClassrooms(): Promise<Classroom[]>
+  createClassroom(data: {
+    campusId: number
+    name: string
+    capacity: number | null
+    type: string
+    note: string | null
+    deviceInfo: string | null
+  }): Promise<Classroom>
+  updateClassroom(
+    id: number,
+    data: {
+      campusId: number
+      name: string
+      capacity: number | null
+      type: string
+      note: string | null
+      deviceInfo: string | null
+      status: string
+    }
+  ): Promise<Classroom>
+  deleteClassroom(id: number): Promise<void>
+  getClassroomUtilization(start: string, end: string): Promise<ClassroomUtilization[]>
+
+  // ---------- 定时备份与系统通知 ----------
+  getBackupConfig(): Promise<BackupConfigInfo>
+  saveBackupConfig(cfg: { enabled: boolean; dir: string; day: number; hour: number; keep: number }): Promise<void>
+  runBackupNow(): Promise<{ success: boolean; files?: string[]; error?: string }>
+  getSystemNotifications(): Promise<SystemNotification[]>
 
   // ---------- 多校区同步（教务/助教角色） ----------
   getSyncInfo(): Promise<SyncInfo>

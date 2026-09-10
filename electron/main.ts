@@ -13,6 +13,7 @@ import { initAuth } from './auth'
 import { initDatabases } from './db'
 import { registerIpcHandlers } from './ipcHandlers'
 import { runSmokeTest, runUiSmokeTest } from './smoke'
+import { initBackupScheduler } from './backupScheduler'
 import { initSync } from './sync'
 
 const isSmokeTest = process.argv.includes('--smoke-test')
@@ -62,6 +63,7 @@ app.whenReady().then(() => {
     initDatabases()
     initAuth(app.getPath('userData'))
     initSync(app.getPath('userData'))
+    initBackupScheduler(app.getPath('userData'))
   }
   registerIpcHandlers()
 

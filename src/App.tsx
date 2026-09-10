@@ -6,6 +6,7 @@
  */
 import {
   AccountBookOutlined,
+  BankOutlined,
   BarChartOutlined,
   CalendarOutlined,
   CloudSyncOutlined,
@@ -17,9 +18,11 @@ import {
   MessageOutlined,
   MoneyCollectOutlined,
   PayCircleOutlined,
+  PercentageOutlined,
   SettingOutlined,
   TeamOutlined,
-  WalletOutlined
+  WalletOutlined,
+  FileSearchOutlined
 } from '@ant-design/icons'
 import { App as AntdApp, Button, Layout, Menu, Spin, Tag } from 'antd'
 import { useCallback, useEffect, useState } from 'react'
@@ -27,15 +30,19 @@ import { api, getErrorMessage } from './api'
 import AgentSidebar from './components/AgentSidebar'
 import CalendarPage from './pages/CalendarPage'
 import CourseFeesPage from './pages/CourseFeesPage'
+import BusinessAnalyticsPage from './pages/BusinessAnalyticsPage'
+import ClassroomUtilizationPage from './pages/ClassroomUtilizationPage'
 import FinanceDashboard from './pages/FinanceDashboard'
 import HistoryMessagesPage from './pages/HistoryMessagesPage'
 import LessonNotesPage from './pages/LessonNotesPage'
 import LoginPage from './pages/LoginPage'
 import ReportsCenterPage from './pages/ReportsCenterPage'
 import ReportsPage from './pages/ReportsPage'
+import ResourcesPage from './pages/ResourcesPage'
 import SettingsPage from './pages/SettingsPage'
 import StudentPaymentsPage from './pages/StudentPaymentsPage'
 import SyncPage from './pages/SyncPage'
+import TeacherBriefsPage from './pages/TeacherBriefsPage'
 import StudentsPage from './pages/StudentsPage'
 import TeacherPaymentsPage from './pages/TeacherPaymentsPage'
 import TeachersPage from './pages/TeachersPage'
@@ -51,15 +58,19 @@ const MENUS: Record<Role, { key: string; icon: JSX.Element; label: string }[]> =
     { key: 'students', icon: <TeamOutlined />, label: '学生管理' },
     { key: 'teachers', icon: <IdcardOutlined />, label: '老师管理' },
     { key: 'reports', icon: <FileTextOutlined />, label: '报告中心' },
+    { key: 'resources', icon: <BankOutlined />, label: '资源管理' },
+    { key: 'utilization', icon: <PercentageOutlined />, label: '教室利用率' },
     { key: 'sync', icon: <CloudSyncOutlined />, label: '多校区同步' },
     { key: 'settings', icon: <SettingOutlined />, label: '系统设置' }
   ],
   finance: [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
+    { key: 'analytics', icon: <BarChartOutlined />, label: '经营分析' },
     { key: 'fees', icon: <MoneyCollectOutlined />, label: '课程费用' },
     { key: 'studentPayments', icon: <PayCircleOutlined />, label: '学生缴费' },
     { key: 'teacherPayments', icon: <WalletOutlined />, label: '老师课酬' },
     { key: 'reports', icon: <LineChartOutlined />, label: '盈亏报表' },
+    { key: 'briefs', icon: <FileSearchOutlined />, label: '老师简报' },
     { key: 'settings', icon: <SettingOutlined />, label: '系统设置' }
   ],
   assistant: [
@@ -157,6 +168,10 @@ export default function App(): JSX.Element {
           return <TeachersPage />
         case 'reports':
           return <ReportsCenterPage />
+        case 'resources':
+          return <ResourcesPage />
+        case 'utilization':
+          return <ClassroomUtilizationPage />
         case 'sync':
           return <SyncPage />
         case 'settings':
@@ -167,6 +182,8 @@ export default function App(): JSX.Element {
       switch (navKey) {
         case 'dashboard':
           return <FinanceDashboard />
+        case 'analytics':
+          return <BusinessAnalyticsPage />
         case 'fees':
           return <CourseFeesPage />
         case 'studentPayments':
@@ -175,6 +192,8 @@ export default function App(): JSX.Element {
           return <TeacherPaymentsPage />
         case 'reports':
           return <ReportsPage />
+        case 'briefs':
+          return <TeacherBriefsPage />
         case 'settings':
           return <SettingsPage />
       }

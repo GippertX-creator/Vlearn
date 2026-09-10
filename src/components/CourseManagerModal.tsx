@@ -9,7 +9,7 @@ import { App as AntdApp, Button, Form, Input, Modal, Popconfirm, Select, Space, 
 import dayjs, { Dayjs } from 'dayjs'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, getErrorMessage, tryApi } from '../api'
-import type { Course, ScheduleRule, Teacher } from '../types'
+import type { Classroom, Course, ScheduleRule, Teacher } from '../types'
 
 const WEEKDAY_OPTIONS = [
   { value: 1, label: '周一' },
@@ -29,6 +29,28 @@ function ruleText(rules: ScheduleRule[]): string {
   return rules.map((r) => `每${weekdayLabel(r.weekday)} ${r.start}-${r.end}`).join('、')
 }
 
+/**
+ * 默认教室下拉选项（v4）：按校区分组。
+ * 仅列表中的可用教室可被选择；维护中/停用的教室置灰展示（附「维护/停用」后缀），
+ * 便于保留已选教室的显示（如某课程已选教室后来停用），但不允许新选。
+ */
+function classroomOptions(classrooms: Classroom[]): { label: string; options: { value: number; label: string; disabled?: boolean }[] }[] {
+  const byCampus = new Map<number, { name: string; rooms: Classroom[] }>()
+  for (const r of classrooms) {
+    const g = byCampus.get(r.campusId) ?? { name: r.campusName, rooms: [] }
+    g.rooms.push(r)
+    byCampus.set(r.campusId, g)
+  }
+  return [...byCampus.values()].map(({ name, rooms }) => ({
+    label: name,
+    options: rooms.map((r) => ({
+      value: r.id,
+      label: r.status === 'available' ? r.name : `${r.name}（维护/停用）`,
+      disabled: r.status !== 'available'
+    }))
+  }))
+}
+
 interface CourseManagerModalProps {
   open: boolean
   onClose: () => void
@@ -40,6 +62,7 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
   const { message } = AntdApp.useApp()
   const [courses, setCourses] = useState<Course[]>([])
   const [teachers, setTeachers] = useState<Teacher[]>([])
+  const [classrooms, setClassrooms] = useState<Classroom[]>([])
   const [grades, setGrades] = useState<string[]>(['高一', '高二', '高三'])
   const [loading, setLoading] = useState(false)
   /** 表单弹窗：null 关闭，否则为新增/编辑 */
@@ -50,9 +73,10 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [c, t, s] = await Promise.all([api.getCourses(), api.getTeachers(), api.getSettings()])
+      const [c, t, s, rooms] = await Promise.all([api.getCourses(), api.getTeachers(), api.getSettings(), api.getClassrooms()])
       setCourses(c)
       setTeachers(t)
+      setClassrooms(rooms)
       if (s.role === 'academic') setGrades(s.grades)
     } catch (err) {
       message.error(getErrorMessage(err))
@@ -79,6 +103,7 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
       grade: course.grade,
       className: course.className,
       defaultTeacherId: course.defaultTeacherId ?? undefined,
+      defaultClassroomId: course.defaultClassroomId ?? undefined,
       scheduleRule: course.scheduleRule.map((r) => ({
         weekday: r.weekday,
         time: [dayjs(`2000-01-01 ${r.start}`, 'YYYY-MM-DD HH:mm'), dayjs(`2000-01-01 ${r.end}`, 'YYYY-MM-DD HH:mm')]
@@ -101,13 +126,15 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
         grade: values.grade,
         className: values.className.trim(),
         defaultTeacherId: values.defaultTeacherId ?? null,
+        defaultClassroomId: values.defaultClassroomId ?? null,
         scheduleRule
       }
-      // Agent：保存前排课冲突检测（默认老师与既有课程时间重叠）
+      // Agent：保存前排课冲突检测（默认老师/默认教室与既有课程时间重叠）
       const conflicts = await tryApi(() =>
         api.checkCourseConflict({
           courseId: editing !== 'new' && editing !== null ? editing.id : null,
           defaultTeacherId: payload.defaultTeacherId,
+          defaultClassroomId: payload.defaultClassroomId,
           scheduleRule: payload.scheduleRule
         })
       )
@@ -191,6 +218,12 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
         key: 'teacher',
         width: 120,
         render: (_: unknown, row: Course) => row.defaultTeacherName || '—'
+      },
+      {
+        title: '默认教室',
+        key: 'classroom',
+        width: 120,
+        render: (_: unknown, row: Course) => row.defaultClassroomName || '—'
       },
       {
         title: '默认上课时间规则',
@@ -282,6 +315,13 @@ export default function CourseManagerModal({ open, onClose, onChanged }: CourseM
               allowClear
               placeholder="可稍后指定"
               options={teachers.map((t) => ({ value: t.id, label: t.name }))}
+            />
+          </Form.Item>
+          <Form.Item name="defaultClassroomId" label="默认教室">
+            <Select
+              allowClear
+              placeholder="可稍后指定（留空则排课不带教室）"
+              options={classroomOptions(classrooms)}
             />
           </Form.Item>
           <Form.Item label="默认上课时间规则" required style={{ marginBottom: 0 }}>

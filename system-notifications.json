@@ -1,0 +1,16 @@
+[
+  {
+    "id": "9157d024-00e0-4e2f-8d15-9e207feb74d1",
+    "ts": "2026-09-10 11:22",
+    "level": "success",
+    "title": "自动备份完成",
+    "detail": "已备份教务/财务/助教三个数据库到：VlearnBackups"
+  },
+  {
+    "id": "c9c301b9-253e-4877-bef0-8052a44edb01",
+    "ts": "2026-09-10 11:11",
+    "level": "success",
+    "title": "自动备份完成",
+    "detail": "已备份教务/财务/助教三个数据库到：VlearnBackups"
+  }
+]

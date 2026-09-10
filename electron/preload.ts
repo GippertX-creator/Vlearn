@@ -37,10 +37,18 @@ const api: VlearnApi = {
     className: string
     defaultTeacherId: number | null
     scheduleRule: ScheduleRule[]
+    defaultClassroomId?: number | null
   }) => ipcRenderer.invoke('courses:create', data),
   updateCourse: (
     id: number,
-    data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }
+    data: {
+      subject: string
+      grade: string
+      className: string
+      defaultTeacherId: number | null
+      scheduleRule: ScheduleRule[]
+      defaultClassroomId?: number | null
+    }
   ) => ipcRenderer.invoke('courses:update', id, data),
   deleteCourse: (id: number) => ipcRenderer.invoke('courses:delete', id),
   regenerateInstances: (courseId: number) => ipcRenderer.invoke('courses:regenerate', courseId),
@@ -58,7 +66,14 @@ const api: VlearnApi = {
   deleteStudent: (id: number) => ipcRenderer.invoke('students:delete', id),
   updateInstance: (
     id: number,
-    data: { date: string; startTime: string; endTime: string; actualTeacherId: number | null; note: string | null }
+    data: {
+      date: string
+      startTime: string
+      endTime: string
+      actualTeacherId: number | null
+      note: string | null
+      classroomId?: number | null
+    }
   ) => ipcRenderer.invoke('instances:update', id, data),
   cancelInstance: (id: number) => ipcRenderer.invoke('instances:cancel', id),
   restoreInstance: (id: number) => ipcRenderer.invoke('instances:restore', id),
@@ -142,14 +157,19 @@ const api: VlearnApi = {
 
   // ---------- Agent ----------
   getAlerts: () => ipcRenderer.invoke('agent:getAlerts'),
-  checkCourseConflict: (data: { courseId: number | null; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }) =>
-    ipcRenderer.invoke('agent:checkCourseConflict', data),
+  checkCourseConflict: (data: {
+    courseId: number | null
+    defaultTeacherId: number | null
+    scheduleRule: ScheduleRule[]
+    defaultClassroomId?: number | null
+  }) => ipcRenderer.invoke('agent:checkCourseConflict', data),
   checkInstanceConflict: (data: {
     instanceId: number
     date: string
     startTime: string
     endTime: string
     actualTeacherId: number | null
+    classroomId?: number | null
   }) => ipcRenderer.invoke('agent:checkInstanceConflict', data),
   suggestSlots: (instanceId: number) => ipcRenderer.invoke('agent:suggestSlots', instanceId),
   checkDuplicateName: (kind: 'student' | 'teacher', name: string) =>
@@ -161,6 +181,74 @@ const api: VlearnApi = {
   trendAnalysis: () => ipcRenderer.invoke('agent:trendAnalysis'),
   smartReport: (module: string, columns: { header: string; key: string }[], rows: Record<string, unknown>[]) =>
     ipcRenderer.invoke('agent:smartReport', module, columns, rows),
+
+  // ---------- 财务 v4 ----------
+  getStudentCourseFees: () => ipcRenderer.invoke('finance:getStudentCourseFees'),
+  upsertStudentCourseFee: (data: {
+    studentId: number
+    courseId: number
+    unitPrice: number
+    discountType: string
+    freeLessons: number
+    note: string | null
+  }) => ipcRenderer.invoke('finance:upsertStudentCourseFee', data),
+  deleteStudentCourseFee: (studentId: number, courseId: number) =>
+    ipcRenderer.invoke('finance:deleteStudentCourseFee', studentId, courseId),
+  updateStudentPaymentLock: (id: number, isLocked: boolean) =>
+    ipcRenderer.invoke('finance:updateStudentPaymentLock', id, isLocked),
+  updateTeacherRate: (teacherId: number, rate: number) => ipcRenderer.invoke('finance:updateTeacherRate', teacherId, rate),
+  updateInstanceRate: (instanceId: number, rate: number | null) =>
+    ipcRenderer.invoke('finance:updateInstanceRate', instanceId, rate),
+  updateStudentCourseStatus: (studentId: number, courseId: number, status: 'active' | 'paused' | 'completed') =>
+    ipcRenderer.invoke('finance:updateStudentCourseStatus', studentId, courseId, status),
+  refundStudentCourse: (studentId: number, courseId: number) =>
+    ipcRenderer.invoke('finance:refundStudentCourse', studentId, courseId),
+  transferStudentCourse: (studentId: number, fromCourseId: number, toCourseId: number, note: string | null) =>
+    ipcRenderer.invoke('finance:transferStudentCourse', studentId, fromCourseId, toCourseId, note),
+  getAuditLogs: (filters?: { action?: string; limit?: number }) => ipcRenderer.invoke('finance:getAuditLogs', filters),
+  getAnalytics: (opts: { granularity: 'month' | 'quarter' | 'year'; start: string; end: string }) =>
+    ipcRenderer.invoke('finance:getAnalytics', opts),
+  getTeacherBriefData: (opts: { teacherId: number; start: string; end: string; includeCompensation: boolean }) =>
+    ipcRenderer.invoke('finance:getTeacherBriefData', opts),
+  briefExportPdf: (html: string) => ipcRenderer.invoke('brief:exportPdf', html),
+
+  // ---------- 校区与教室 ----------
+  getCampuses: () => ipcRenderer.invoke('campuses:getAll'),
+  createCampus: (data: { name: string; address: string | null; note: string | null }) =>
+    ipcRenderer.invoke('campuses:create', data),
+  updateCampus: (id: number, data: { name: string; address: string | null; note: string | null }) =>
+    ipcRenderer.invoke('campuses:update', id, data),
+  deleteCampus: (id: number) => ipcRenderer.invoke('campuses:delete', id),
+  getClassrooms: () => ipcRenderer.invoke('classrooms:getAll'),
+  createClassroom: (data: {
+    campusId: number
+    name: string
+    capacity: number | null
+    type: string
+    note: string | null
+    deviceInfo: string | null
+  }) => ipcRenderer.invoke('classrooms:create', data),
+  updateClassroom: (
+    id: number,
+    data: {
+      campusId: number
+      name: string
+      capacity: number | null
+      type: string
+      note: string | null
+      deviceInfo: string | null
+      status: string
+    }
+  ) => ipcRenderer.invoke('classrooms:update', id, data),
+  deleteClassroom: (id: number) => ipcRenderer.invoke('classrooms:delete', id),
+  getClassroomUtilization: (start: string, end: string) => ipcRenderer.invoke('classrooms:getUtilization', start, end),
+
+  // ---------- 定时备份与系统通知 ----------
+  getBackupConfig: () => ipcRenderer.invoke('backup:getConfig'),
+  saveBackupConfig: (cfg: { enabled: boolean; dir: string; day: number; hour: number; keep: number }) =>
+    ipcRenderer.invoke('backup:saveConfig', cfg),
+  runBackupNow: () => ipcRenderer.invoke('backup:runNow'),
+  getSystemNotifications: () => ipcRenderer.invoke('notifications:getRecent'),
 
   // ---------- 多校区同步 ----------
   getSyncInfo: () => ipcRenderer.invoke('sync:getInfo'),

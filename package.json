@@ -1,6 +1,6 @@
 {
   "name": "vlearn",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Vlearn 教培机构教务与财务管理系统（本地桌面应用，数据存储于 SQLite）",
   "main": "out/main/index.js",
   "author": "Vlearn",
@@ -28,6 +28,7 @@
   },
   "devDependencies": {
     "@ant-design/icons": "^5.5.1",
+    "@ant-design/plots": "^2.6.8",
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.16.10",
     "@types/react": "^18.3.10",

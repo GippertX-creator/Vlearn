@@ -21,10 +21,14 @@ import { format } from 'date-fns'
 import type {
   AcademicSettings,
   AgentAlert,
+  AnalyticsData,
   AnomalyCheckResult,
   AssistantSettings,
   AttendanceStatus,
   AuthStatus,
+  Campus,
+  Classroom,
+  ClassroomUtilization,
   ConflictItem,
   Course,
   DashboardData,
@@ -43,9 +47,11 @@ import type {
   ScheduleRule,
   SlotSuggestion,
   Student,
+  StudentCourseFee,
   StudentDetail,
   StudentPayment,
   Teacher,
+  TeacherBriefData,
   TeacherDetail,
   TeacherPayment
 } from '../src/types'
@@ -77,6 +83,15 @@ import {
   SyncStats
 } from './sync'
 import { changePassword, login, logout, requireRole, roleLabel } from './auth'
+import {
+  BackupConfig,
+  BackupResult,
+  getBackupConfig,
+  getSystemNotifications,
+  runBackup,
+  saveBackupConfig,
+  SystemNotification
+} from './backupScheduler'
 import { closeAll, getDb, getDbPath, getMigrationError, getSettingValue, initDatabases, setSettingValue } from './db'
 import { buildWorkbook, exportFileName } from './excelExport'
 import { generateInstances } from './schedule'
@@ -106,6 +121,26 @@ function localCampus(): string {
   return getCampusId()
 }
 
+/** 学生-课程状态中文名（v4：退费/转课/暂停等） */
+function courseStatusText(status: string): string {
+  return (
+    {
+      active: '在读',
+      paused: '暂停',
+      refunded: '已退费',
+      completed: '已结课',
+      transferred: '已转课'
+    }[status] ?? status
+  )
+}
+
+/** 财务操作审计日志（v4：所有费用修改记录前后值） */
+function logAudit(action: string, targetType: string, targetId: number, oldValue: unknown, newValue: unknown): void {
+  getDb('finance')
+    .prepare('INSERT INTO finance_audit_logs (operator, action, target_type, target_id, old_value, new_value) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('finance', action, targetType, targetId, oldValue == null ? null : JSON.stringify(oldValue), newValue == null ? null : JSON.stringify(newValue))
+}
+
 // ---------------------------------------------------------------------------
 // 行映射工具（snake_case → camelCase；非财务角色屏蔽费用字段）
 // ---------------------------------------------------------------------------
@@ -120,6 +155,8 @@ interface CourseRow {
   default_schedule_rule: string | null
   fee: number
   pay_per_session: number
+  default_classroom_id: number | null
+  default_classroom_name: string | null
   created_at: string
   updated_at: string
 }
@@ -142,15 +179,18 @@ function mapCourse(row: CourseRow, maskFee: boolean): Course {
     // 费用字段仅财务可见：其他角色在 IPC 边界清零
     fee: maskFee ? 0 : row.fee,
     payPerSession: maskFee ? 0 : row.pay_per_session,
+    defaultClassroomId: row.default_classroom_id,
+    defaultClassroomName: row.default_classroom_name,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   }
 }
 
 const COURSE_SELECT = `
-  SELECT c.*, t.name AS default_teacher_name
+  SELECT c.*, t.name AS default_teacher_name, cr.name AS default_classroom_name
   FROM courses c
   LEFT JOIN teachers t ON t.id = c.default_teacher_id
+  LEFT JOIN classrooms cr ON cr.id = c.default_classroom_id
 `
 
 function fetchCourse(id: number, maskFee = false): Course | null {
@@ -193,6 +233,8 @@ interface InstanceRow {
   class_name: string
   default_teacher_name: string | null
   actual_teacher_name: string | null
+  classroom_id: number | null
+  classroom_name: string | null
 }
 
 function mapInstance(row: InstanceRow): ScheduleInstance {
@@ -209,9 +251,12 @@ function mapInstance(row: InstanceRow): ScheduleInstance {
     subject: row.subject,
     grade: row.grade,
     className: row.class_name,
-    defaultTeacherName: row.default_teacher_name
+    defaultTeacherName: row.default_teacher_name,
+    classroomId: row.classroom_id,
+    classroomName: row.classroom_name
   }
 }
+
 
 // ---------------------------------------------------------------------------
 // 登录与角色设置
@@ -263,7 +308,14 @@ function registerCourseHandlers(): void {
     'courses:create',
     (
       _e,
-      data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }
+      data: {
+        subject: string
+        grade: string
+        className: string
+        defaultTeacherId: number | null
+        scheduleRule: ScheduleRule[]
+        defaultClassroomId?: number | null
+      }
     ): Course => {
       requireRole(['academic'])
       const subject = String(data.subject ?? '').trim()
@@ -272,10 +324,10 @@ function registerCourseHandlers(): void {
       if (!subject || !grade || !className) throw new Error('科目、年级、班级号不能为空')
       const result = getDb('academic')
         .prepare(
-          `INSERT INTO courses (subject, grade, class_name, default_teacher_id, default_schedule_rule, sync_origin)
-           VALUES (?, ?, ?, ?, ?, ?)`
+          `INSERT INTO courses (subject, grade, class_name, default_teacher_id, default_schedule_rule, default_classroom_id, sync_origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
         )
-        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), localCampus())
+        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), data.defaultClassroomId ?? null, localCampus())
       const courseId = Number(result.lastInsertRowid)
       const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
       generateInstances(getDb('academic'), courseId, data.scheduleRule ?? [], new Date(), weeks, localCampus())
@@ -288,7 +340,14 @@ function registerCourseHandlers(): void {
     (
       _e,
       id: number,
-      data: { subject: string; grade: string; className: string; defaultTeacherId: number | null; scheduleRule: ScheduleRule[] }
+      data: {
+        subject: string
+        grade: string
+        className: string
+        defaultTeacherId: number | null
+        scheduleRule: ScheduleRule[]
+        defaultClassroomId?: number | null
+      }
     ): Course => {
       requireRole(['academic'])
       if (!fetchCourse(id)) throw new Error('课程不存在')
@@ -299,9 +358,9 @@ function registerCourseHandlers(): void {
       getDb('academic')
         .prepare(
           `UPDATE courses SET subject = ?, grade = ?, class_name = ?, default_teacher_id = ?, default_schedule_rule = ?,
-           updated_at = datetime('now') WHERE id = ?`
+           default_classroom_id = ?, updated_at = datetime('now') WHERE id = ?`
         )
-        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), id)
+        .run(subject, grade, className, data.defaultTeacherId ?? null, JSON.stringify(data.scheduleRule ?? []), data.defaultClassroomId ?? null, id)
       return fetchCourse(id)!
     }
   )
@@ -380,30 +439,42 @@ function registerCourseHandlers(): void {
 function registerTeacherHandlers(): void {
   ipcMain.handle('teachers:getAll', (): Teacher[] => {
     guardAcademicRead()
+    const role = requireRole(['academic', 'finance', 'assistant'])
     const rows = getDb('academic').prepare('SELECT * FROM teachers ORDER BY id').all() as {
       id: number
       name: string
       note: string | null
+      default_rate_per_lesson: number | null
     }[]
     return rows.map((row) => {
       const courseIds = relationIds('teacher_courses', 'teacher_id', row.id)
-      return { id: row.id, name: row.name, note: row.note, courseIds, courseLabels: courseLabelsByIds(courseIds) }
+      return {
+        id: row.id,
+        name: row.name,
+        note: row.note,
+        courseIds,
+        courseLabels: courseLabelsByIds(courseIds),
+        // 默认课酬仅财务可见：其余角色在 IPC 边界清零
+        defaultRatePerLesson: role === 'finance' ? row.default_rate_per_lesson ?? 0 : 0
+      }
     })
   })
 
   ipcMain.handle('teachers:getDetail', (_e, id: number): TeacherDetail => {
     guardAcademicRead()
     const row = getDb('academic').prepare('SELECT * FROM teachers WHERE id = ?').get(id) as
-      | { id: number; name: string; note: string | null }
+      | { id: number; name: string; note: string | null; default_rate_per_lesson?: number | null }
       | undefined
     if (!row) throw new Error('老师不存在')
     const courseIds = relationIds('teacher_courses', 'teacher_id', id)
+    const role = requireRole(['academic', 'finance', 'assistant'])
     const teacher: Teacher = {
       id: row.id,
       name: row.name,
       note: row.note,
       courseIds,
-      courseLabels: courseLabelsByIds(courseIds)
+      courseLabels: courseLabelsByIds(courseIds),
+      defaultRatePerLesson: role === 'finance' ? (row as { default_rate_per_lesson?: number | null }).default_rate_per_lesson ?? 0 : 0
     }
     const total = getDb('academic')
       .prepare(
@@ -456,7 +527,8 @@ function registerTeacherHandlers(): void {
       name,
       note: data.note ?? null,
       courseIds: data.courseIds ?? [],
-      courseLabels: courseLabelsByIds(data.courseIds ?? [])
+      courseLabels: courseLabelsByIds(data.courseIds ?? []),
+      defaultRatePerLesson: 0
     }
   })
 
@@ -468,12 +540,16 @@ function registerTeacherHandlers(): void {
       .prepare(`UPDATE teachers SET name = ?, note = ?, updated_at = datetime('now') WHERE id = ?`)
       .run(name, data.note ?? null, id)
     replaceTeacherCourses(id, data.courseIds ?? [])
+    const rateRow = getDb('academic').prepare('SELECT default_rate_per_lesson FROM teachers WHERE id = ?').get(id) as
+      | { default_rate_per_lesson: number | null }
+      | undefined
     return {
       id,
       name,
       note: data.note ?? null,
       courseIds: data.courseIds ?? [],
-      courseLabels: courseLabelsByIds(data.courseIds ?? [])
+      courseLabels: courseLabelsByIds(data.courseIds ?? []),
+      defaultRatePerLesson: rateRow?.default_rate_per_lesson ?? 0
     }
   })
 
@@ -673,11 +749,13 @@ function registerInstanceHandlers(): void {
     const rows = getDb('academic')
       .prepare(
         `SELECT si.*, c.subject, c.grade, c.class_name,
-                def.name AS default_teacher_name, act.name AS actual_teacher_name
-         FROM schedule_instances si
-         JOIN courses c ON c.id = si.course_id
-         LEFT JOIN teachers def ON def.id = c.default_teacher_id
-         LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+                def.name AS default_teacher_name, act.name AS actual_teacher_name,
+                cr.name AS classroom_name
+FROM schedule_instances si
+JOIN courses c ON c.id = si.course_id
+LEFT JOIN teachers def ON def.id = c.default_teacher_id
+LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+LEFT JOIN classrooms cr ON cr.id = si.classroom_id
          WHERE si.date BETWEEN ? AND ?
          ORDER BY si.date, si.start_time, si.id`
       )
@@ -691,11 +769,13 @@ function registerInstanceHandlers(): void {
     const row = getDb('academic')
       .prepare(
         `SELECT si.*, c.subject, c.grade, c.class_name,
-                def.name AS default_teacher_name, act.name AS actual_teacher_name
-         FROM schedule_instances si
-         JOIN courses c ON c.id = si.course_id
-         LEFT JOIN teachers def ON def.id = c.default_teacher_id
-         LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+                def.name AS default_teacher_name, act.name AS actual_teacher_name,
+                cr.name AS classroom_name
+FROM schedule_instances si
+JOIN courses c ON c.id = si.course_id
+LEFT JOIN teachers def ON def.id = c.default_teacher_id
+LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+LEFT JOIN classrooms cr ON cr.id = si.classroom_id
          WHERE si.id = ?`
       )
       .get(id) as InstanceRow | undefined
@@ -703,7 +783,7 @@ function registerInstanceHandlers(): void {
     const course = fetchCourse(row.course_id, role !== 'finance')!
     const students = getDb('academic')
       .prepare(
-        `SELECT s.id, s.name, s.school_class, a.status AS attendance_status
+        `SELECT s.id, s.name, s.school_class, a.status AS attendance_status, sc.status AS course_status
          FROM student_courses sc
          JOIN students s ON s.id = sc.student_id
          LEFT JOIN attendances a ON a.student_id = sc.student_id AND a.schedule_instance_id = ?
@@ -715,6 +795,7 @@ function registerInstanceHandlers(): void {
       name: string
       school_class: string | null
       attendance_status: AttendanceStatus | null
+      course_status: string
     }[]
     return {
       instance: mapInstance(row),
@@ -723,7 +804,8 @@ function registerInstanceHandlers(): void {
         id: s.id,
         name: s.name,
         schoolClass: s.school_class,
-        attendanceStatus: s.attendance_status
+        attendanceStatus: s.attendance_status,
+        courseStatus: s.course_status
       }))
     }
   })
@@ -733,7 +815,14 @@ function registerInstanceHandlers(): void {
     (
       _e,
       id: number,
-      data: { date: string; startTime: string; endTime: string; actualTeacherId: number | null; note: string | null }
+      data: {
+        date: string
+        startTime: string
+        endTime: string
+        actualTeacherId: number | null
+        note: string | null
+        classroomId?: number | null
+      }
     ): ScheduleInstance => {
       requireRole(['academic'])
       if (!data.date || !data.startTime || !data.endTime) throw new Error('日期与时间不能为空')
@@ -741,18 +830,20 @@ function registerInstanceHandlers(): void {
         .prepare(
           `UPDATE schedule_instances
            SET date = ?, start_time = ?, end_time = ?, actual_teacher_id = ?, note = ?, status = 'adjusted',
-               updated_at = datetime('now')
+               classroom_id = ?, updated_at = datetime('now')
            WHERE id = ?`
         )
-        .run(data.date, data.startTime, data.endTime, data.actualTeacherId ?? null, data.note ?? null, id)
+        .run(data.date, data.startTime, data.endTime, data.actualTeacherId ?? null, data.note ?? null, data.classroomId ?? null, id)
       const row = getDb('academic')
         .prepare(
           `SELECT si.*, c.subject, c.grade, c.class_name,
-                  def.name AS default_teacher_name, act.name AS actual_teacher_name
-           FROM schedule_instances si
-           JOIN courses c ON c.id = si.course_id
-           LEFT JOIN teachers def ON def.id = c.default_teacher_id
-           LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+                  def.name AS default_teacher_name, act.name AS actual_teacher_name,
+                  cr.name AS classroom_name
+FROM schedule_instances si
+JOIN courses c ON c.id = si.course_id
+LEFT JOIN teachers def ON def.id = c.default_teacher_id
+LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+LEFT JOIN classrooms cr ON cr.id = si.classroom_id
            WHERE si.id = ?`
         )
         .get(id) as InstanceRow
@@ -779,6 +870,18 @@ function registerInstanceHandlers(): void {
     (_e, data: { scheduleInstanceId: number; studentId: number; status: AttendanceStatus; note?: string | null }): void => {
       requireRole(['academic'])
       if (!['present', 'leave', 'absent'].includes(data.status)) throw new Error('无效的考勤状态')
+      // 学生在该课程非"在读"（暂停/退费/转课/结课）时不可操作考勤
+      const courseStatus = getDb('academic')
+        .prepare(
+          `SELECT sc.status FROM student_courses sc
+           JOIN schedule_instances si ON si.course_id = sc.course_id
+           WHERE si.id = ? AND sc.student_id = ?`
+        )
+        .get(data.scheduleInstanceId, data.studentId) as { status: string } | undefined
+      if (!courseStatus) throw new Error('该学生未报名此课程')
+      if (courseStatus.status !== 'active') {
+        throw new Error(`该学生当前课程状态为「${courseStatusText(courseStatus.status)}」，不可操作考勤`)
+      }
       getDb('academic')
         .prepare(
           `INSERT INTO attendances (schedule_instance_id, student_id, status, note, sync_origin)
@@ -805,10 +908,12 @@ function registerInstanceHandlers(): void {
       .prepare('SELECT course_id FROM schedule_instances WHERE id = ?')
       .get(scheduleInstanceId) as { course_id: number } | undefined
     if (!instance) throw new Error('课程实例不存在')
+    // 仅标记"在读"状态的学生（暂停/退费/转课/结课不可点名）
     const result = getDb('academic')
       .prepare(
         `INSERT INTO attendances (schedule_instance_id, student_id, status, sync_origin)
-         SELECT ?, sc.student_id, 'present', ? FROM student_courses sc WHERE sc.course_id = ?
+         SELECT ?, sc.student_id, 'present', ? FROM student_courses sc
+         WHERE sc.course_id = ? AND sc.status = 'active'
          ON CONFLICT(schedule_instance_id, student_id) DO UPDATE SET status = 'present',
                          updated_at = datetime('now'), sync_origin = excluded.sync_origin`
       )
@@ -871,6 +976,7 @@ function registerFinanceHandlers(): void {
       payment_method: string
       payment_date: string
       note: string | null
+      is_locked: number
     }[]
     return rows.map((r) => {
       const student = getDb('academic').prepare('SELECT name FROM students WHERE id = ?').get(r.student_id) as
@@ -888,6 +994,7 @@ function registerFinanceHandlers(): void {
         paymentMethod: r.payment_method,
         paymentDate: r.payment_date,
         note: r.note,
+        isLocked: r.is_locked,
         studentName: student?.name ?? `学生#${r.student_id}`,
         courseLabel: course ? courseLabel(course.subject, course.grade, course.class_name) : `课程#${r.course_id}`
       }
@@ -904,12 +1011,15 @@ function registerFinanceHandlers(): void {
     note: string | null
   }): void => {
     if (!data.studentId || !data.courseId || !data.paymentDate) throw new Error('学生、课程、缴费日期不能为空')
+    const amountPaid = Number(data.amountPaid) || 0
+    // 有实缴金额的记录自动锁定（不参与自动重算）
+    const isLocked = amountPaid > 0 ? 1 : 0
     getDb('finance')
       .prepare(
-        `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note, is_locked)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(data.studentId, data.courseId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentMethod || '现金', data.paymentDate, data.note ?? null)
+      .run(data.studentId, data.courseId, Number(data.amountDue) || 0, amountPaid, data.paymentMethod || '现金', data.paymentDate, data.note ?? null, isLocked)
   }
 
   ipcMain.handle('finance:createStudentPayment', (_e, data: Parameters<typeof insertStudentPayment>[0]): void => {
@@ -934,14 +1044,20 @@ function registerFinanceHandlers(): void {
     ): void => {
       guard()
       if (!data.studentId || !data.courseId || !data.paymentDate) throw new Error('学生、课程、缴费日期不能为空')
+      const amountPaid = Number(data.amountPaid) || 0
+      const old = getDb('finance').prepare('SELECT * FROM student_payments WHERE id = ?').get(id) as Record<string, unknown> | undefined
       getDb('finance')
         .prepare(
           `UPDATE student_payments
            SET student_id = ?, course_id = ?, amount_due = ?, amount_paid = ?, payment_method = ?, payment_date = ?, note = ?,
-               edits_count = edits_count + 1
+               is_locked = ?, edits_count = edits_count + 1
            WHERE id = ?`
         )
-        .run(data.studentId, data.courseId, Number(data.amountDue) || 0, Number(data.amountPaid) || 0, data.paymentMethod || '现金', data.paymentDate, data.note ?? null, id)
+        .run(data.studentId, data.courseId, Number(data.amountDue) || 0, amountPaid, data.paymentMethod || '现金', data.paymentDate, data.note ?? null, amountPaid > 0 ? 1 : 0, id)
+      // 审计日志（金额变化才记录，避免噪声）
+      if (old && (Number(old.amount_due) !== Number(data.amountDue) || Number(old.amount_paid) !== amountPaid)) {
+        logAudit('update_payment', 'payment', id, { amountDue: old.amount_due, amountPaid: old.amount_paid }, { amountDue: Number(data.amountDue), amountPaid: amountPaid })
+      }
     }
   )
 
@@ -952,8 +1068,10 @@ function registerFinanceHandlers(): void {
 
   ipcMain.handle('finance:autoCalcStudentPayments', (): number => {
     guard()
-    // 应缴 = 课程费用 × 计费出勤次数（出勤必计费、请假免费、缺勤按财务设置）
-    // 课程费用与考勤均为教务库只读数据
+    // v4 应缴 = max(0, 计费次数 − 赠送课时) × 个性化单价
+    // - 计费次数：出勤必计费、请假免费、缺勤按财务设置 charge_absent
+    // - 个性化单价：student_course_fees.unit_price（未设置则用课程费用 courses.fee）
+    // - 仅计算"在读"状态的学生课程；已锁定记录（is_locked=1）不自动更新
     const chargeAbsent = (getSettingValue('finance', 'charge_absent') ?? '1') === '1'
     const statuses = chargeAbsent ? "('present','absent')" : "('present')"
     const pairs = getDb('academic')
@@ -967,26 +1085,40 @@ function registerFinanceHandlers(): void {
              WHERE si.course_id = sc.course_id AND si.status != 'cancelled'
            )
            AND a.status IN ${statuses}
+         WHERE sc.status = 'active'
          GROUP BY sc.student_id, sc.course_id`
       )
       .all() as { student_id: number; course_id: number; cnt: number; fee: number }[]
 
-    const upsert = getDb('finance').prepare(
-      `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note)
-       VALUES (?, ?, ?, 0, ?, ?, '自动计算应缴')`
+    const feeStmt = getDb('finance').prepare(
+      'SELECT unit_price, free_lessons FROM student_course_fees WHERE student_id = ? AND course_id = ?'
     )
-    const updateDue = getDb('finance').prepare('UPDATE student_payments SET amount_due = ? WHERE student_id = ? AND course_id = ?')
+    const upsert = getDb('finance').prepare(
+      `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note, is_locked)
+       VALUES (?, ?, ?, 0, ?, ?, '自动计算应缴', 0)`
+    )
+    const updateDue = getDb('finance').prepare(
+      'UPDATE student_payments SET amount_due = ? WHERE student_id = ? AND course_id = ? AND is_locked = 0'
+    )
     const today = format(new Date(), 'yyyy-MM-dd')
     const firstMethod = (JSON.parse(getSettingValue('finance', 'payment_methods') ?? '["现金"]') as string[])[0] ?? '现金'
     const tx = getDb('finance').transaction(() => {
       let count = 0
       for (const p of pairs) {
+        const feeRow = feeStmt.get(p.student_id, p.course_id) as { unit_price: number; free_lessons: number } | undefined
+        const unitPrice = feeRow && feeRow.unit_price > 0 ? feeRow.unit_price : p.fee
+        const freeLessons = feeRow?.free_lessons ?? 0
+        const billable = Math.max(0, p.cnt - freeLessons)
+        const due = Math.round(billable * unitPrice * 100) / 100
         const existing = getDb('finance')
-          .prepare('SELECT id FROM student_payments WHERE student_id = ? AND course_id = ?')
-          .get(p.student_id, p.course_id) as { id: number } | undefined
-        const due = Math.round(p.cnt * p.fee * 100) / 100
-        if (existing) updateDue.run(due, p.student_id, p.course_id)
-        else upsert.run(p.student_id, p.course_id, due, firstMethod, today)
+          .prepare('SELECT id, is_locked FROM student_payments WHERE student_id = ? AND course_id = ?')
+          .get(p.student_id, p.course_id) as { id: number; is_locked: number } | undefined
+        if (existing) {
+          if (existing.is_locked === 1) continue // 锁定记录不自动更新
+          updateDue.run(due, p.student_id, p.course_id)
+        } else {
+          upsert.run(p.student_id, p.course_id, due, firstMethod, today)
+        }
         count++
       }
       return count
@@ -1008,6 +1140,7 @@ function registerFinanceHandlers(): void {
       amount_paid: number
       payment_date: string
       note: string | null
+      rate_source: string
     }[]
     return rows.map((r) => {
       const teacher = getDb('academic').prepare('SELECT name FROM teachers WHERE id = ?').get(r.teacher_id) as
@@ -1029,6 +1162,7 @@ function registerFinanceHandlers(): void {
         amountPaid: r.amount_paid,
         paymentDate: r.payment_date,
         note: r.note,
+        rateSource: r.rate_source,
         teacherName: teacher?.name ?? `老师#${r.teacher_id}`,
         instanceLabel: si
           ? `${si.date} ${courseLabel(si.subject, si.grade, si.class_name)} ${si.start_time}-${si.end_time}`
@@ -1081,29 +1215,54 @@ function registerFinanceHandlers(): void {
 
   ipcMain.handle('finance:autoCalcTeacherPayments', (): number => {
     guard()
-    // 应付 = 课程单次课酬标准；代课场景支付给代课老师（教务库只读）
+    // v4 应付课酬优先级：课程实例实际课酬(actual_rate) → 老师默认课酬(default_rate_per_lesson>0)
+    //   → 课程单次课酬标准(pay_per_session)；代课场景支付给代课老师（教务库只读）
     const instances = getDb('academic')
       .prepare(
-        `SELECT si.id, si.date, si.actual_teacher_id, c.default_teacher_id, c.pay_per_session
-         FROM schedule_instances si JOIN courses c ON c.id = si.course_id
+        `SELECT si.id, si.date, si.actual_teacher_id, si.actual_rate,
+                c.default_teacher_id, c.pay_per_session,
+                COALESCE(act.default_rate_per_lesson, def.default_rate_per_lesson) AS teacher_rate
+         FROM schedule_instances si
+         JOIN courses c ON c.id = si.course_id
+         LEFT JOIN teachers def ON def.id = c.default_teacher_id
+         LEFT JOIN teachers act ON act.id = si.actual_teacher_id
          WHERE si.status != 'cancelled'`
       )
-      .all() as { id: number; date: string; actual_teacher_id: number | null; default_teacher_id: number | null; pay_per_session: number }[]
+      .all() as {
+      id: number
+      date: string
+      actual_teacher_id: number | null
+      actual_rate: number | null
+      default_teacher_id: number | null
+      pay_per_session: number
+      teacher_rate: number | null
+    }[]
     const exists = getDb('finance').prepare('SELECT id FROM teacher_payments WHERE teacher_id = ? AND schedule_instance_id = ?')
     const insert = getDb('finance').prepare(
-      `INSERT INTO teacher_payments (teacher_id, schedule_instance_id, amount_due, amount_paid, payment_date, note)
-       VALUES (?, ?, ?, 0, ?, '自动计算应付')`
+      `INSERT INTO teacher_payments (teacher_id, schedule_instance_id, amount_due, amount_paid, payment_date, note, rate_source)
+       VALUES (?, ?, ?, 0, ?, '自动计算应付', ?)`
     )
-    const update = getDb('finance').prepare('UPDATE teacher_payments SET amount_due = ? WHERE teacher_id = ? AND schedule_instance_id = ?')
+    const update = getDb('finance').prepare(
+      'UPDATE teacher_payments SET amount_due = ?, rate_source = ? WHERE teacher_id = ? AND schedule_instance_id = ?'
+    )
     const tx = getDb('finance').transaction(() => {
       let count = 0
       for (const si of instances) {
         const teacherId = si.actual_teacher_id ?? si.default_teacher_id
         if (teacherId === null) continue
-        const due = Math.round(si.pay_per_session * 100) / 100
+        let rate = si.pay_per_session
+        let source = 'course'
+        if (si.actual_rate !== null && si.actual_rate !== undefined) {
+          rate = si.actual_rate
+          source = 'instance'
+        } else if (si.teacher_rate !== null && si.teacher_rate > 0) {
+          rate = si.teacher_rate
+          source = 'teacher'
+        }
+        const due = Math.round(rate * 100) / 100
         const existing = exists.get(teacherId, si.id) as { id: number } | undefined
-        if (existing) update.run(due, teacherId, si.id)
-        else insert.run(teacherId, si.id, due, si.date)
+        if (existing) update.run(due, source, teacherId, si.id)
+        else insert.run(teacherId, si.id, due, si.date, source)
         count++
       }
       return count
@@ -1116,11 +1275,13 @@ function registerFinanceHandlers(): void {
     const rows = getDb('academic')
       .prepare(
         `SELECT si.*, c.subject, c.grade, c.class_name,
-                def.name AS default_teacher_name, act.name AS actual_teacher_name
-         FROM schedule_instances si
-         JOIN courses c ON c.id = si.course_id
-         LEFT JOIN teachers def ON def.id = c.default_teacher_id
-         LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+                def.name AS default_teacher_name, act.name AS actual_teacher_name,
+                cr.name AS classroom_name
+FROM schedule_instances si
+JOIN courses c ON c.id = si.course_id
+LEFT JOIN teachers def ON def.id = c.default_teacher_id
+LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+LEFT JOIN classrooms cr ON cr.id = si.classroom_id
          WHERE si.status != 'cancelled'
          ORDER BY si.date DESC, si.start_time DESC`
       )
@@ -1158,6 +1319,779 @@ function registerFinanceHandlers(): void {
       profit: Math.round((totalIncome - totalExpense) * 100) / 100
     })
     return rows
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 财务 v4：个性化费用 / 课酬差异化 / 学生课程状态 / 审计 / 经营分析 / 老师简报
+// ---------------------------------------------------------------------------
+
+function registerFinanceV4Handlers(): void {
+  const guard = (): void => {
+    requireRole(['finance'])
+  }
+
+  // ---------- 学生个性化课程费用 ----------
+
+  ipcMain.handle('finance:getStudentCourseFees', (): (StudentCourseFee & { studentName: string; courseLabel: string })[] => {
+    guard()
+    const rows = getDb('finance').prepare('SELECT * FROM student_course_fees ORDER BY id').all() as StudentCourseFeeRow[]
+    return rows.map((r) => {
+      const student = getDb('academic').prepare('SELECT name FROM students WHERE id = ?').get(r.student_id) as
+        | { name: string }
+        | undefined
+      const course = getDb('academic')
+        .prepare('SELECT subject, grade, class_name FROM courses WHERE id = ?')
+        .get(r.course_id) as { subject: string; grade: string; class_name: string } | undefined
+      return {
+        id: r.id,
+        studentId: r.student_id,
+        courseId: r.course_id,
+        unitPrice: r.unit_price,
+        discountType: r.discount_type,
+        freeLessons: r.free_lessons,
+        note: r.note,
+        studentName: student?.name ?? `学生#${r.student_id}`,
+        courseLabel: course ? courseLabel(course.subject, course.grade, course.class_name) : `课程#${r.course_id}`
+      }
+    })
+  })
+
+  ipcMain.handle(
+    'finance:upsertStudentCourseFee',
+    (
+      _e,
+      data: { studentId: number; courseId: number; unitPrice: number; discountType: string; freeLessons: number; note: string | null }
+    ): void => {
+      guard()
+      if (!data.studentId || !data.courseId) throw new Error('学生与课程不能为空')
+      const old = getDb('finance')
+        .prepare('SELECT * FROM student_course_fees WHERE student_id = ? AND course_id = ?')
+        .get(data.studentId, data.courseId) as Record<string, unknown> | undefined
+      const newValue = {
+        unitPrice: Number(data.unitPrice) || 0,
+        discountType: data.discountType || 'none',
+        freeLessons: Math.max(0, Number(data.freeLessons) || 0),
+        note: data.note ?? null
+      }
+      getDb('finance')
+        .prepare(
+          `INSERT INTO student_course_fees (student_id, course_id, unit_price, discount_type, free_lessons, note)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(student_id, course_id) DO UPDATE SET
+             unit_price = excluded.unit_price, discount_type = excluded.discount_type,
+             free_lessons = excluded.free_lessons, note = excluded.note, updated_at = datetime('now')`
+        )
+        .run(data.studentId, data.courseId, newValue.unitPrice, newValue.discountType, newValue.freeLessons, newValue.note)
+      logAudit('update_student_fee', 'student_course', data.studentId * 100000 + data.courseId, old ?? null, newValue)
+    }
+  )
+
+  ipcMain.handle('finance:deleteStudentCourseFee', (_e, studentId: number, courseId: number): void => {
+    guard()
+    const old = getDb('finance')
+      .prepare('SELECT * FROM student_course_fees WHERE student_id = ? AND course_id = ?')
+      .get(studentId, courseId) as Record<string, unknown> | undefined
+    getDb('finance').prepare('DELETE FROM student_course_fees WHERE student_id = ? AND course_id = ?').run(studentId, courseId)
+    if (old) logAudit('delete_student_fee', 'student_course', studentId * 100000 + courseId, old, null)
+  })
+
+  // ---------- 缴费记录锁定 ----------
+
+  ipcMain.handle('finance:updateStudentPaymentLock', (_e, id: number, isLocked: boolean): void => {
+    guard()
+    const old = getDb('finance').prepare('SELECT is_locked FROM student_payments WHERE id = ?').get(id) as
+      | { is_locked: number }
+      | undefined
+    if (!old) throw new Error('缴费记录不存在')
+    getDb('finance').prepare('UPDATE student_payments SET is_locked = ? WHERE id = ?').run(isLocked ? 1 : 0, id)
+    logAudit(isLocked ? 'lock_payment' : 'unlock_payment', 'payment', id, { isLocked: old.is_locked }, { isLocked: isLocked ? 1 : 0 })
+  })
+
+  // ---------- 老师课酬差异化 ----------
+
+  ipcMain.handle('finance:updateTeacherRate', (_e, teacherId: number, rate: number): void => {
+    guard()
+    // 课酬字段存于教务库 teachers 表，但仅财务可写（与 fee/pay_per_session 同属财务可写列例外）
+    const old = getDb('academic').prepare('SELECT default_rate_per_lesson FROM teachers WHERE id = ?').get(teacherId) as
+      | { default_rate_per_lesson: number | null }
+      | undefined
+    if (!old) throw new Error('老师不存在')
+    getDb('academic')
+      .prepare(`UPDATE teachers SET default_rate_per_lesson = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(Number(rate) || 0, teacherId)
+    logAudit('update_teacher_rate', 'teacher', teacherId, { rate: old.default_rate_per_lesson ?? 0 }, { rate: Number(rate) || 0 })
+  })
+
+  ipcMain.handle('finance:updateInstanceRate', (_e, instanceId: number, rate: number | null): void => {
+    guard()
+    const old = getDb('academic').prepare('SELECT actual_rate FROM schedule_instances WHERE id = ?').get(instanceId) as
+      | { actual_rate: number | null }
+      | undefined
+    if (!old) throw new Error('课程实例不存在')
+    getDb('academic')
+      .prepare(`UPDATE schedule_instances SET actual_rate = ?, updated_at = datetime('now') WHERE id = ?`)
+      .run(rate === null ? null : Number(rate), instanceId)
+    logAudit('update_instance_rate', 'schedule_instance', instanceId, { rate: old.actual_rate }, { rate })
+  })
+
+  // ---------- 学生课程状态（暂停/恢复/结课） ----------
+
+  ipcMain.handle(
+    'finance:updateStudentCourseStatus',
+    (_e, studentId: number, courseId: number, status: 'active' | 'paused' | 'completed'): void => {
+      guard()
+      if (!['active', 'paused', 'completed'].includes(status)) throw new Error('无效的课程状态')
+      const old = getDb('academic')
+        .prepare('SELECT status FROM student_courses WHERE student_id = ? AND course_id = ?')
+        .get(studentId, courseId) as { status: string } | undefined
+      if (!old) throw new Error('该学生未报名此课程')
+      getDb('academic')
+        .prepare(`UPDATE student_courses SET status = ?, updated_at = datetime('now') WHERE student_id = ? AND course_id = ?`)
+        .run(status, studentId, courseId)
+      logAudit('update_course_status', 'student_course', studentId * 100000 + courseId, { status: old.status }, { status })
+    }
+  )
+
+  // ---------- 退费 ----------
+
+  ipcMain.handle(
+    'finance:refundStudentCourse',
+    (_e, studentId: number, courseId: number): { refund: number; consumed: number; paid: number } => {
+      guard()
+      const sc = getDb('academic')
+        .prepare('SELECT status FROM student_courses WHERE student_id = ? AND course_id = ?')
+        .get(studentId, courseId) as { status: string } | undefined
+      if (!sc) throw new Error('该学生未报名此课程')
+      if (sc.status === 'refunded') throw new Error('该课程已退费，请勿重复操作')
+      // 已缴总额 − 已消耗费用；已消耗 = max(0, 计费次数 − 赠送课时) × 个性化单价
+      const feeRow = getDb('finance')
+        .prepare('SELECT unit_price, free_lessons FROM student_course_fees WHERE student_id = ? AND course_id = ?')
+        .get(studentId, courseId) as { unit_price: number; free_lessons: number } | undefined
+      const course = getDb('academic').prepare('SELECT fee FROM courses WHERE id = ?').get(courseId) as { fee: number }
+      const unitPrice = feeRow && feeRow.unit_price > 0 ? feeRow.unit_price : course.fee
+      const freeLessons = feeRow?.free_lessons ?? 0
+      const billable = (
+        getDb('academic')
+          .prepare(
+            `SELECT COUNT(*) AS c FROM attendances a
+             JOIN schedule_instances si ON si.id = a.schedule_instance_id
+             WHERE a.student_id = ? AND si.course_id = ? AND a.status = 'present'`
+          )
+          .get(studentId, courseId) as { c: number }
+      ).c
+      const consumed = Math.max(0, billable - freeLessons) * unitPrice
+      const paid = (
+        getDb('finance')
+          .prepare('SELECT COALESCE(SUM(amount_paid), 0) AS s FROM student_payments WHERE student_id = ? AND course_id = ?')
+          .get(studentId, courseId) as { s: number }
+      ).s
+      const refund = Math.round(Math.max(0, paid - consumed) * 100) / 100
+      const tx = getDb('finance').transaction(() => {
+        // 生成负数实缴的退费记录（冲减收入）
+        getDb('finance')
+          .prepare(
+            `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note, is_locked)
+             VALUES (?, ?, 0, ?, '退费', ?, ?, 1)`
+          )
+          .run(studentId, courseId, -refund, format(new Date(), 'yyyy-MM-dd'), '系统退费')
+        getDb('academic')
+          .prepare(`UPDATE student_courses SET status = 'refunded', updated_at = datetime('now') WHERE student_id = ? AND course_id = ?`)
+          .run(studentId, courseId)
+      })
+      tx()
+      logAudit('refund', 'student_course', studentId * 100000 + courseId, { paid, consumed, status: sc.status }, { refund, status: 'refunded' })
+      return { refund, consumed, paid }
+    }
+  )
+
+  // ---------- 转课 ----------
+
+  ipcMain.handle(
+    'finance:transferStudentCourse',
+    (_e, studentId: number, fromCourseId: number, toCourseId: number, note: string | null): { balance: number } => {
+      guard()
+      if (fromCourseId === toCourseId) throw new Error('转出与转入课程不能相同')
+      const from = getDb('academic')
+        .prepare('SELECT status FROM student_courses WHERE student_id = ? AND course_id = ?')
+        .get(studentId, fromCourseId) as { status: string } | undefined
+      if (!from) throw new Error('该学生未报名原课程')
+      // 按退费逻辑结清原课程余额（可退可补：正数补缴、负数退还）
+      const refundInfo = { paid: 0, consumed: 0 }
+      const feeRow = getDb('finance')
+        .prepare('SELECT unit_price, free_lessons FROM student_course_fees WHERE student_id = ? AND course_id = ?')
+        .get(studentId, fromCourseId) as { unit_price: number; free_lessons: number } | undefined
+      const course = getDb('academic').prepare('SELECT fee FROM courses WHERE id = ?').get(fromCourseId) as { fee: number }
+      const unitPrice = feeRow && feeRow.unit_price > 0 ? feeRow.unit_price : course.fee
+      const freeLessons = feeRow?.free_lessons ?? 0
+      const billable = (
+        getDb('academic')
+          .prepare(
+            `SELECT COUNT(*) AS c FROM attendances a
+             JOIN schedule_instances si ON si.id = a.schedule_instance_id
+             WHERE a.student_id = ? AND si.course_id = ? AND a.status = 'present'`
+          )
+          .get(studentId, fromCourseId) as { c: number }
+      ).c
+      refundInfo.consumed = Math.max(0, billable - freeLessons) * unitPrice
+      refundInfo.paid = (
+        getDb('finance')
+          .prepare('SELECT COALESCE(SUM(amount_paid), 0) AS s FROM student_payments WHERE student_id = ? AND course_id = ?')
+          .get(studentId, fromCourseId) as { s: number }
+      ).s
+      const balance = Math.round((refundInfo.paid - refundInfo.consumed) * 100) / 100
+      const tx = getDb('finance').transaction(() => {
+        // 余额结清记录（正=补缴、负=退还）
+        getDb('finance')
+          .prepare(
+            `INSERT INTO student_payments (student_id, course_id, amount_due, amount_paid, payment_method, payment_date, note, is_locked)
+             VALUES (?, ?, 0, ?, '转课结清', ?, ?, 1)`
+          )
+          .run(studentId, fromCourseId, balance, format(new Date(), 'yyyy-MM-dd'), note ? `转课结清：${note}` : '转课结清')
+        getDb('academic')
+          .prepare(`UPDATE student_courses SET status = 'transferred', updated_at = datetime('now') WHERE student_id = ? AND course_id = ?`)
+          .run(studentId, fromCourseId)
+        // 新课程自动建立关联（已存在则恢复为在读）
+        const exist = getDb('academic')
+          .prepare('SELECT 1 FROM student_courses WHERE student_id = ? AND course_id = ?')
+          .get(studentId, toCourseId)
+        if (exist) {
+          getDb('academic')
+            .prepare(`UPDATE student_courses SET status = 'active', updated_at = datetime('now') WHERE student_id = ? AND course_id = ?`)
+            .run(studentId, toCourseId)
+        } else {
+          getDb('academic')
+            .prepare(
+              `INSERT INTO student_courses (student_id, course_id, status, updated_at, sync_origin) VALUES (?, ?, 'active', datetime('now'), ?)`
+            )
+            .run(studentId, toCourseId, localCampus())
+        }
+      })
+      tx()
+      logAudit(
+        'transfer',
+        'student_course',
+        studentId * 100000 + fromCourseId,
+        { fromCourseId, status: from.status },
+        { toCourseId, balance }
+      )
+      return { balance }
+    }
+  )
+
+  // ---------- 审计日志查询 ----------
+
+  ipcMain.handle(
+    'finance:getAuditLogs',
+    (_e, filters: { action?: string; limit?: number }): { id: number; action: string; operator: string; targetType: string; targetId: number; oldValue: string | null; newValue: string | null; createdAt: string }[] => {
+      guard()
+      const limit = Math.min(500, Math.max(1, Number(filters?.limit) || 200))
+      if (filters?.action) {
+        const rows = getDb('finance')
+          .prepare('SELECT id, action, operator, target_type, target_id, old_value, new_value, created_at FROM finance_audit_logs WHERE action = ? ORDER BY id DESC LIMIT ?')
+          .all(filters.action, limit) as {
+          id: number
+          action: string
+          operator: string
+          target_type: string
+          target_id: number
+          old_value: string | null
+          new_value: string | null
+          created_at: string
+        }[]
+        return rows.map((r) => ({
+          id: r.id,
+          action: r.action,
+          operator: r.operator,
+          targetType: r.target_type,
+          targetId: r.target_id,
+          oldValue: r.old_value,
+          newValue: r.new_value,
+          createdAt: r.created_at
+        }))
+      }
+      const rows = getDb('finance')
+        .prepare('SELECT id, action, operator, target_type, target_id, old_value, new_value, created_at FROM finance_audit_logs ORDER BY id DESC LIMIT ?')
+        .all(limit) as {
+        id: number
+        action: string
+        operator: string
+        target_type: string
+        target_id: number
+        old_value: string | null
+        new_value: string | null
+        created_at: string
+      }[]
+      return rows.map((r) => ({
+        id: r.id,
+        action: r.action,
+        operator: r.operator,
+        targetType: r.target_type,
+        targetId: r.target_id,
+        oldValue: r.old_value,
+        newValue: r.new_value,
+        createdAt: r.created_at
+      }))
+    }
+  )
+}
+
+interface StudentCourseFeeRow {
+  id: number
+  student_id: number
+  course_id: number
+  unit_price: number
+  discount_type: string
+  free_lessons: number
+  note: string | null
+}
+
+// StudentCourseFee 类型自 src/types.ts 导入，此处不再重复声明
+
+// ---------------------------------------------------------------------------
+// 校区与教室资源（v4；写仅教务，读三角色）
+// ---------------------------------------------------------------------------
+
+interface CampusRow {
+  id: number
+  name: string
+  address: string | null
+  note: string | null
+}
+
+interface ClassroomRow {
+  id: number
+  campus_id: number
+  name: string
+  capacity: number | null
+  type: string
+  note: string | null
+  device_info: string | null
+  status: string
+  campus_name: string
+}
+
+function mapClassroom(row: ClassroomRow): Classroom {
+  return {
+    id: row.id,
+    campusId: row.campus_id,
+    campusName: row.campus_name,
+    name: row.name,
+    capacity: row.capacity,
+    type: row.type,
+    note: row.note,
+    deviceInfo: row.device_info,
+    status: row.status as Classroom['status']
+  }
+}
+
+function registerResourceHandlers(): void {
+  ipcMain.handle('campuses:getAll', (): Campus[] => {
+    guardAcademicRead()
+    const rows = getDb('academic').prepare('SELECT * FROM campuses ORDER BY id').all() as CampusRow[]
+    return rows.map((r) => ({ id: r.id, name: r.name, address: r.address, note: r.note }))
+  })
+
+  ipcMain.handle('campuses:create', (_e, data: { name: string; address: string | null; note: string | null }): Campus => {
+    requireRole(['academic'])
+    const name = String(data.name ?? '').trim()
+    if (!name) throw new Error('校区名称不能为空')
+    const result = getDb('academic')
+      .prepare('INSERT INTO campuses (name, address, note) VALUES (?, ?, ?)')
+      .run(name, data.address ?? null, data.note ?? null)
+    return { id: Number(result.lastInsertRowid), name, address: data.address ?? null, note: data.note ?? null }
+  })
+
+  ipcMain.handle('campuses:update', (_e, id: number, data: { name: string; address: string | null; note: string | null }): Campus => {
+    requireRole(['academic'])
+    const name = String(data.name ?? '').trim()
+    if (!name) throw new Error('校区名称不能为空')
+    getDb('academic').prepare('UPDATE campuses SET name = ?, address = ?, note = ? WHERE id = ?').run(name, data.address ?? null, data.note ?? null, id)
+    return { id, name, address: data.address ?? null, note: data.note ?? null }
+  })
+
+  ipcMain.handle('campuses:delete', (_e, id: number): void => {
+    requireRole(['academic'])
+    // 级联删除该校区教室；课程/实例中的教室引用置空
+    const tx = getDb('academic').transaction(() => {
+      getDb('academic').prepare('UPDATE courses SET default_classroom_id = NULL WHERE default_classroom_id IN (SELECT id FROM classrooms WHERE campus_id = ?)').run(id)
+      getDb('academic').prepare('UPDATE schedule_instances SET classroom_id = NULL WHERE classroom_id IN (SELECT id FROM classrooms WHERE campus_id = ?)').run(id)
+      getDb('academic').prepare('DELETE FROM campuses WHERE id = ?').run(id)
+    })
+    tx()
+  })
+
+  ipcMain.handle('classrooms:getAll', (): Classroom[] => {
+    guardAcademicRead()
+    const rows = getDb('academic')
+      .prepare(
+        `SELECT cr.*, c.name AS campus_name FROM classrooms cr JOIN campuses c ON c.id = cr.campus_id ORDER BY c.id, cr.id`
+      )
+      .all() as ClassroomRow[]
+    return rows.map(mapClassroom)
+  })
+
+  ipcMain.handle(
+    'classrooms:create',
+    (_e, data: { campusId: number; name: string; capacity: number | null; type: string; note: string | null; deviceInfo: string | null }): Classroom => {
+      requireRole(['academic'])
+      const name = String(data.name ?? '').trim()
+      if (!data.campusId || !name) throw new Error('校区与教室名称不能为空')
+      const result = getDb('academic')
+        .prepare(
+          `INSERT INTO classrooms (campus_id, name, capacity, type, note, device_info)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(data.campusId, name, data.capacity ?? null, data.type || '普通', data.note ?? null, data.deviceInfo ?? null)
+      const row = getDb('academic')
+        .prepare(`SELECT cr.*, c.name AS campus_name FROM classrooms cr JOIN campuses c ON c.id = cr.campus_id WHERE cr.id = ?`)
+        .get(Number(result.lastInsertRowid)) as ClassroomRow
+      return mapClassroom(row)
+    }
+  )
+
+  ipcMain.handle(
+    'classrooms:update',
+    (
+      _e,
+      id: number,
+      data: { campusId: number; name: string; capacity: number | null; type: string; note: string | null; deviceInfo: string | null; status: string }
+    ): Classroom => {
+      requireRole(['academic'])
+      const name = String(data.name ?? '').trim()
+      if (!data.campusId || !name) throw new Error('校区与教室名称不能为空')
+      getDb('academic')
+        .prepare(
+          `UPDATE classrooms SET campus_id = ?, name = ?, capacity = ?, type = ?, note = ?, device_info = ?, status = ?,
+           updated_at = datetime('now') WHERE id = ?`
+        )
+        .run(data.campusId, name, data.capacity ?? null, data.type || '普通', data.note ?? null, data.deviceInfo ?? null, data.status || 'available', id)
+      const row = getDb('academic')
+        .prepare(`SELECT cr.*, c.name AS campus_name FROM classrooms cr JOIN campuses c ON c.id = cr.campus_id WHERE cr.id = ?`)
+        .get(id) as ClassroomRow
+      return mapClassroom(row)
+    }
+  )
+
+  ipcMain.handle('classrooms:delete', (_e, id: number): void => {
+    requireRole(['academic'])
+    const tx = getDb('academic').transaction(() => {
+      getDb('academic').prepare('UPDATE courses SET default_classroom_id = NULL WHERE default_classroom_id = ?').run(id)
+      getDb('academic').prepare('UPDATE schedule_instances SET classroom_id = NULL WHERE classroom_id = ?').run(id)
+      getDb('academic').prepare('DELETE FROM classrooms WHERE id = ?').run(id)
+    })
+    tx()
+  })
+
+  // 教室利用率：指定范围内每间教室（可用时间 = 每天 8:00-22:00 的营业时段）
+  ipcMain.handle(
+    'classrooms:getUtilization',
+    (_e, start: string, end: string): ClassroomUtilization[] => {
+      guardAcademicRead()
+      const rows = getDb('academic')
+        .prepare(
+          `SELECT cr.id, cr.name, cr.status, cr.campus_id, c.name AS campus_name
+           FROM classrooms cr JOIN campuses c ON c.id = cr.campus_id ORDER BY c.id, cr.id`
+        )
+        .all() as { id: number; name: string; status: string; campus_id: number; campus_name: string }[]
+      const result: ClassroomUtilization[] = []
+      for (const cr of rows) {
+        const occupied = (getDb('academic')
+          .prepare(
+            `SELECT SUM((CAST(substr(end_time, 1, 2) AS INTEGER) * 60 + CAST(substr(end_time, 4, 2) AS INTEGER))
+                 - (CAST(substr(start_time, 1, 2) AS INTEGER) * 60 + CAST(substr(start_time, 4, 2) AS INTEGER))) AS m
+             FROM schedule_instances si
+             JOIN courses c ON c.id = si.course_id
+             WHERE COALESCE(si.classroom_id, c.default_classroom_id) = ?
+               AND si.status != 'cancelled' AND si.date BETWEEN ? AND ?`
+          )
+          .get(cr.id, start, end) as { m: number | null }).m ?? 0
+        const days = Math.max(1, Math.floor((new Date(end).getTime() - new Date(start).getTime()) / 86400000) + 1)
+        const available = days * 14 * 60 // 每天 8:00-22:00 = 14 小时
+        const rate = cr.status === 'available' ? Math.min(100, Math.round((occupied / available) * 1000) / 10) : 0
+        result.push({
+          id: cr.id,
+          name: cr.name,
+          campusId: cr.campus_id,
+          campusName: cr.campus_name,
+          status: cr.status,
+          scheduledMinutes: occupied,
+          availableMinutes: available,
+          rate
+        })
+      }
+      return result
+    }
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 财务 v4：经营分析数据 + 老师简报 + 简报 PDF + 定时备份/系统通知
+// ---------------------------------------------------------------------------
+
+function registerAnalyticsHandlers(): void {
+  const guard = (): void => {
+    requireRole(['finance'])
+  }
+
+  /** 经营分析数据（月度聚合后按粒度分桶；收入=学生实缴，支出=老师实付） */
+  ipcMain.handle(
+    'finance:getAnalytics',
+    (_e, opts: { granularity: 'month' | 'quarter' | 'year'; start: string; end: string }): AnalyticsData => {
+      guard()
+      const g = opts.granularity ?? 'month'
+      const start = opts.start ?? format(new Date(), 'yyyy-01-01')
+      const end = opts.end ?? format(new Date(), 'yyyy-12-31')
+
+      const incomeMonths = getDb('finance')
+        .prepare(
+          `SELECT substr(payment_date, 1, 7) AS m, SUM(amount_paid) AS s
+           FROM student_payments WHERE payment_date BETWEEN ? AND ? GROUP BY m ORDER BY m`
+        )
+        .all(start, end) as { m: string; s: number }[]
+      const expenseMonths = getDb('finance')
+        .prepare(
+          `SELECT substr(payment_date, 1, 7) AS m, SUM(amount_paid) AS s
+           FROM teacher_payments WHERE payment_date BETWEEN ? AND ? GROUP BY m ORDER BY m`
+        )
+        .all(start, end) as { m: string; s: number }[]
+
+      const bucketKey = (month: string): string => {
+        if (g === 'year') return month.slice(0, 4)
+        if (g === 'quarter') {
+          const q = Math.floor((parseInt(month.slice(5, 7), 10) - 1) / 3) + 1
+          return `${month.slice(0, 4)}-Q${q}`
+        }
+        return month
+      }
+      const buckets = new Map<string, { bucket: string; income: number; expense: number }>()
+      const add = (rows: { m: string; s: number }[], isIncome: boolean): void => {
+        for (const r of rows) {
+          const key = bucketKey(r.m)
+          const b = buckets.get(key) ?? { bucket: key, income: 0, expense: 0 }
+          if (isIncome) b.income += r.s
+          else b.expense += r.s
+          buckets.set(key, b)
+        }
+      }
+      add(incomeMonths, true)
+      add(expenseMonths, false)
+      const trend = [...buckets.values()]
+        .sort((a, b) => a.bucket.localeCompare(b.bucket))
+        .map((b) => ({
+          bucket: b.bucket,
+          income: Math.round(b.income * 100) / 100,
+          expense: Math.round(b.expense * 100) / 100,
+          profit: Math.round((b.income - b.expense) * 100) / 100
+        }))
+
+      // 收入/支出构成：财务库聚合后与教务库（课程/老师）在内存中关联
+      const courseMap = new Map<number, { subject: string; label: string }>()
+      for (const c of getDb('academic').prepare('SELECT id, subject, grade, class_name FROM courses').all() as {
+        id: number
+        subject: string
+        grade: string
+        class_name: string
+      }[]) {
+        courseMap.set(c.id, { subject: c.subject, label: courseLabel(c.subject, c.grade, c.class_name) })
+      }
+      const payments = getDb('finance')
+        .prepare('SELECT course_id, payment_method, amount_paid FROM student_payments WHERE payment_date BETWEEN ? AND ?')
+        .all(start, end) as { course_id: number; payment_method: string; amount_paid: number }[]
+      const incomeBySubject = new Map<string, number>()
+      const incomeByMethod = new Map<string, number>()
+      for (const p of payments) {
+        const subject = courseMap.get(p.course_id)?.subject ?? '未分类'
+        incomeBySubject.set(subject, (incomeBySubject.get(subject) ?? 0) + p.amount_paid)
+        incomeByMethod.set(p.payment_method, (incomeByMethod.get(p.payment_method) ?? 0) + p.amount_paid)
+      }
+      const teacherMap = new Map<number, string>()
+      for (const t of getDb('academic').prepare('SELECT id, name FROM teachers').all() as { id: number; name: string }[]) {
+        teacherMap.set(t.id, t.name)
+      }
+      const tpayments = getDb('finance')
+        .prepare('SELECT teacher_id, schedule_instance_id, amount_paid FROM teacher_payments WHERE payment_date BETWEEN ? AND ?')
+        .all(start, end) as { teacher_id: number; schedule_instance_id: number; amount_paid: number }[]
+      const instanceCourseMap = new Map<number, string>()
+      for (const si of getDb('academic')
+        .prepare('SELECT si.id, c.subject, c.grade, c.class_name FROM schedule_instances si JOIN courses c ON c.id = si.course_id')
+        .all() as { id: number; subject: string; grade: string; class_name: string }[]) {
+        instanceCourseMap.set(si.id, courseLabel(si.subject, si.grade, si.class_name))
+      }
+      const expenseByTeacher = new Map<string, number>()
+      const expenseByCourse = new Map<string, number>()
+      for (const p of tpayments) {
+        const teacher = teacherMap.get(p.teacher_id) ?? '未分类'
+        expenseByTeacher.set(teacher, (expenseByTeacher.get(teacher) ?? 0) + p.amount_paid)
+        const label = instanceCourseMap.get(p.schedule_instance_id) ?? '未分类'
+        expenseByCourse.set(label, (expenseByCourse.get(label) ?? 0) + p.amount_paid)
+      }
+
+      return {
+        trend,
+        incomeBySubject: [...incomeBySubject.entries()].map(([k, v]) => ({ name: k, value: Math.round(v * 100) / 100 })),
+        incomeByMethod: [...incomeByMethod.entries()].map(([k, v]) => ({ name: k, value: Math.round(v * 100) / 100 })),
+        expenseByTeacher: [...expenseByTeacher.entries()].map(([k, v]) => ({ name: k, value: Math.round(v * 100) / 100 })),
+        expenseByCourse: [...expenseByCourse.entries()].map(([k, v]) => ({ name: k, value: Math.round(v * 100) / 100 }))
+      }
+    }
+  )
+
+  /** 老师简报数据（财务生成后线下转发给任课老师；含课酬选项需显式开启） */
+  ipcMain.handle(
+    'finance:getTeacherBriefData',
+    (
+      _e,
+      opts: { teacherId: number; start: string; end: string; includeCompensation: boolean }
+    ): TeacherBriefData => {
+      guard()
+      const academic = getDb('academic')
+      const teacher = academic.prepare('SELECT id, name, note FROM teachers WHERE id = ?').get(opts.teacherId) as
+        | { id: number; name: string; note: string | null }
+        | undefined
+      if (!teacher) throw new Error('老师不存在')
+
+      // 所教课程
+      const courseIds = (academic
+        .prepare('SELECT course_id FROM teacher_courses WHERE teacher_id = ?')
+        .all(opts.teacherId) as { course_id: number }[]).map((r) => r.course_id)
+      const courses = courseIds.length
+        ? (academic
+            .prepare(`SELECT id, subject, grade, class_name FROM courses WHERE id IN (${courseIds.map(() => '?').join(',')})`)
+            .all(...courseIds) as { id: number; subject: string; grade: string; class_name: string }[])
+        : []
+
+      // 时间范围内的课程安排（含教室）
+      const instances = academic
+        .prepare(
+          `SELECT si.*, c.subject, c.grade, c.class_name, cr.name AS classroom_name,
+                  def.name AS default_teacher_name, act.name AS actual_teacher_name
+           FROM schedule_instances si
+           JOIN courses c ON c.id = si.course_id
+           LEFT JOIN teachers def ON def.id = c.default_teacher_id
+           LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+           LEFT JOIN classrooms cr ON cr.id = COALESCE(si.classroom_id, c.default_classroom_id)
+           WHERE si.date BETWEEN ? AND ? AND si.status != 'cancelled'
+             AND (si.actual_teacher_id = ? OR (si.actual_teacher_id IS NULL AND c.default_teacher_id = ?))
+           ORDER BY si.date, si.start_time`
+        )
+        .all(opts.start, opts.end, opts.teacherId, opts.teacherId) as {
+        date: string
+        start_time: string
+        end_time: string
+        subject: string
+        grade: string
+        class_name: string
+        classroom_name: string | null
+      }[]
+
+      // 学生名单及近期出勤（每名学生最近 4 次课的出勤统计）
+      const students: TeacherBriefData['students'] = []
+      for (const c of courses) {
+        const enrolled = academic
+          .prepare(
+            `SELECT s.id, s.name, s.school_class FROM student_courses sc JOIN students s ON s.id = sc.student_id
+             WHERE sc.course_id = ? ORDER BY s.name`
+          )
+          .all(c.id) as { id: number; name: string; school_class: string | null }[]
+        for (const s of enrolled) {
+          const stats = academic
+            .prepare(
+              `SELECT status FROM (
+                 SELECT a.status, si.date FROM attendances a
+                 JOIN schedule_instances si ON si.id = a.schedule_instance_id
+                 WHERE a.student_id = ? AND si.course_id = ?
+                 ORDER BY si.date DESC, si.start_time DESC LIMIT 4
+               )`
+            )
+            .all(s.id, c.id) as { status: string }[]
+          const counts = { present: 0, leave: 0, absent: 0 }
+          for (const x of stats) counts[x.status as 'present' | 'leave' | 'absent']++
+          students.push({
+            name: s.name,
+            schoolClass: s.school_class,
+            courseLabel: courseLabel(c.subject, c.grade, c.class_name),
+            stats: counts
+          })
+        }
+      }
+
+      // 课酬汇总（可选；不含任何学生缴费信息）
+      let compensation: TeacherBriefData['compensation'] = null
+      if (opts.includeCompensation) {
+        const row = getDb('finance')
+          .prepare(
+            `SELECT COALESCE(SUM(amount_due), 0) AS due, COALESCE(SUM(amount_paid), 0) AS paid
+             FROM teacher_payments WHERE teacher_id = ? AND payment_date BETWEEN ? AND ?`
+          )
+          .get(opts.teacherId, opts.start, opts.end) as { due: number; paid: number }
+        compensation = { due: Math.round(row.due * 100) / 100, paid: Math.round(row.paid * 100) / 100 }
+      }
+
+      return {
+        teacher: { id: teacher.id, name: teacher.name, note: teacher.note },
+        courses: courses.map((c) => courseLabel(c.subject, c.grade, c.class_name)),
+        instances: instances.map((i) => ({
+          date: i.date,
+          startTime: i.start_time,
+          endTime: i.end_time,
+          courseLabel: courseLabel(i.subject, i.grade, i.class_name),
+          classroomName: i.classroom_name
+        })),
+        students,
+        compensation
+      }
+    }
+  )
+
+  /** 简报导出 PDF（渲染层生成 HTML，主进程离屏打印） */
+  ipcMain.handle(
+    'brief:exportPdf',
+    async (_e, html: string): Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }> => {
+      guard()
+      const { canceled, filePath } = await dialog.showSaveDialog({
+        title: '导出老师简报 PDF',
+        defaultPath: `Vlearn_老师简报_${format(new Date(), 'yyyy-MM-dd')}.pdf`,
+        filters: [{ name: 'PDF 文件', extensions: ['pdf'] }]
+      })
+      if (canceled || !filePath) return { success: false, canceled: true }
+      try {
+        const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true } })
+        await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(String(html)))
+        const pdf = await win.webContents.printToPDF({ printBackground: true, pageSize: 'A4' })
+        win.destroy()
+        fs.writeFileSync(filePath, pdf)
+        return { success: true, path: filePath }
+      } catch (err) {
+        return { success: false, error: `PDF 生成失败：${(err as Error).message}` }
+      }
+    }
+  )
+}
+
+function registerBackupIpcHandlers(): void {
+  const guard = (): void => {
+    requireRole(['academic', 'finance', 'assistant'])
+  }
+
+  ipcMain.handle('backup:getConfig', (): BackupConfig => {
+    guard()
+    return getBackupConfig()
+  })
+
+  ipcMain.handle('backup:saveConfig', (_e, cfg: { enabled: boolean; dir: string; day: number; hour: number; keep: number }): void => {
+    guard()
+    saveBackupConfig(cfg)
+  })
+
+  ipcMain.handle('backup:runNow', async (): Promise<BackupResult> => {
+    guard()
+    return runBackup()
+  })
+
+  ipcMain.handle('notifications:getRecent', (): SystemNotification[] => {
+    guard()
+    return getSystemNotifications()
   })
 }
 
@@ -1645,6 +2579,10 @@ export function registerIpcHandlers(): void {
   registerStudentHandlers()
   registerInstanceHandlers()
   registerFinanceHandlers()
+  registerFinanceV4Handlers()
+  registerAnalyticsHandlers()
+  registerResourceHandlers()
+  registerBackupIpcHandlers()
   registerAssistantHandlers()
   registerAgentHandlers()
   registerSyncHandlers()

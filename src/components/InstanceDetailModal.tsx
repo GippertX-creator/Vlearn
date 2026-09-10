@@ -32,7 +32,7 @@ import dayjs, { Dayjs } from 'dayjs'
 import { useCallback, useEffect, useState } from 'react'
 import { api, getErrorMessage } from '../api'
 import { useRole } from '../roleContext'
-import type { AttendanceStatus, ConflictItem, InstanceDetail, ScheduleInstance, SlotSuggestion, Teacher } from '../types'
+import type { AttendanceStatus, Classroom, ConflictItem, InstanceDetail, ScheduleInstance, SlotSuggestion, Teacher } from '../types'
 import AttendanceStatusTag from './AttendanceStatusTag'
 import ExportExcelButton from './ExportExcelButton'
 import LessonNoteEditorModal from './LessonNoteEditorModal'
@@ -58,14 +58,43 @@ function ConflictList({ conflicts }: { conflicts: ConflictItem[] }): JSX.Element
       <ul style={{ paddingLeft: 20, maxHeight: 220, overflow: 'auto' }}>
         {conflicts.map((c, i) => (
           <li key={i}>
-            {c.type === 'teacher' ? '老师' : '学生'}「{c.who}」在 {c.date} {c.startTime}-{c.endTime} 已有
-            「{c.courseLabel}」的课程
+            {c.type === 'classroom' ? (
+              <>
+                教室「{c.who}」在 {c.date} {c.startTime}-{c.endTime} 已被「{c.courseLabel}」占用
+              </>
+            ) : (
+              <>
+                {c.type === 'teacher' ? '老师' : '学生'}「{c.who}」在 {c.date} {c.startTime}-{c.endTime} 已有
+                「{c.courseLabel}」的课程
+              </>
+            )}
           </li>
         ))}
       </ul>
       <p>是否仍然保存？</p>
     </div>
   )
+}
+
+/**
+ * 调课可选教室下拉选项（v4）：按校区分组。
+ * 维护中/停用的教室置灰展示（附「维护/停用」后缀，便于显示实例当前已选教室），不可选择。
+ */
+function classroomOptions(classrooms: Classroom[]): { label: string; options: { value: number; label: string; disabled?: boolean }[] }[] {
+  const byCampus = new Map<number, { name: string; rooms: Classroom[] }>()
+  for (const r of classrooms) {
+    const g = byCampus.get(r.campusId) ?? { name: r.campusName, rooms: [] }
+    g.rooms.push(r)
+    byCampus.set(r.campusId, g)
+  }
+  return [...byCampus.values()].map(({ name, rooms }) => ({
+    label: name,
+    options: rooms.map((r) => ({
+      value: r.id,
+      label: r.status === 'available' ? r.name : `${r.name}（维护/停用）`,
+      disabled: r.status !== 'available'
+    }))
+  }))
 }
 
 export default function InstanceDetailModal({ instanceId, onClose, onChanged }: InstanceDetailModalProps): JSX.Element {
@@ -75,6 +104,7 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
   const readonly = role === 'assistant'
   const [detail, setDetail] = useState<InstanceDetail | null>(null)
   const [teachers, setTeachers] = useState<Teacher[]>([])
+  const [classrooms, setClassrooms] = useState<Classroom[]>([])
   const [loading, setLoading] = useState(false)
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -87,9 +117,10 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
     if (!instanceId) return
     setLoading(true)
     try {
-      const [d, t] = await Promise.all([api.getInstanceDetail(instanceId), api.getTeachers()])
+      const [d, t, rooms] = await Promise.all([api.getInstanceDetail(instanceId), api.getTeachers(), api.getClassrooms()])
       setDetail(d)
       setTeachers(t)
+      setClassrooms(rooms)
     } catch (err) {
       message.error(getErrorMessage(err))
       onClose()
@@ -147,6 +178,7 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
         dayjs(detail.instance.date + ' ' + detail.instance.endTime, 'YYYY-MM-DD HH:mm')
       ],
       actualTeacherId: detail.instance.actualTeacherId ?? detail.course.defaultTeacherId,
+      classroomId: detail.instance.classroomId ?? undefined,
       note: detail.instance.note
     })
     setSuggestions([])
@@ -168,10 +200,11 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
   const doSaveAdjust = async (force: boolean): Promise<void> => {
     if (!detail) return
     const values = await adjustForm.validateFields()
-    const { date, time, actualTeacherId, note } = values as {
+    const { date, time, actualTeacherId, classroomId, note } = values as {
       date: Dayjs
       time: [Dayjs, Dayjs]
       actualTeacherId: number | null
+      classroomId?: number | null
       note?: string | null
     }
     const payload = {
@@ -179,6 +212,7 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
       startTime: time[0].format('HH:mm'),
       endTime: time[1].format('HH:mm'),
       actualTeacherId: actualTeacherId ?? null,
+      classroomId: classroomId ?? null,
       note: note ?? null
     }
     // Agent：保存前冲突检测
@@ -324,6 +358,9 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
                 </Tag>
               )}
             </Descriptions.Item>
+            <Descriptions.Item label="教室" span={2}>
+              {instance.classroomName ?? course.defaultClassroomName ?? '—'}
+            </Descriptions.Item>
             <Descriptions.Item label="状态" span={2}>
               <StatusTag status={instance.status} />
               {instance.note && <span style={{ marginLeft: 8, color: '#888' }}>备注：{instance.note}</span>}
@@ -349,6 +386,14 @@ export default function InstanceDetailModal({ instanceId, onClose, onChanged }: 
                   placeholder="默认老师"
                   style={{ width: 130 }}
                   options={teachers.map((t) => ({ value: t.id, label: t.name }))}
+                />
+              </Form.Item>
+              <Form.Item name="classroomId" label="教室">
+                <Select
+                  allowClear
+                  placeholder="默认教室"
+                  style={{ width: 150 }}
+                  options={classroomOptions(classrooms)}
                 />
               </Form.Item>
               <Form.Item name="note" label="备注">

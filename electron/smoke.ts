@@ -281,8 +281,165 @@ export async function runSmokeTest(mainDir: string): Promise<void> {
   const version = await call<string>(`window.api.getAppVersion()`)
   assert(!!version && version !== '0.0.0', '应用版本号可读')
 
+  // ---------- v4：校区/教室资源（教务） ----------
+  console.log('\n[7] 资源：校区 / 教室 / 教室冲突 / 利用率')
+  await call(`window.api.login('academic', 'admin123')`)
+  await assertRejected(`window.api.getStudentCourseFees()`, '教务访问个性化费用被拒绝')
+  await assertRejected(`window.api.getAnalytics({ granularity: 'month', start: '2026-01-01', end: '2026-12-31' })`, '教务访问经营分析被拒绝')
+  const campus = await call<{ id: number }>(`window.api.createCampus({ name: '本部', address: '中山路1号', note: null })`)
+  assert(campus.id > 0, '创建校区')
+  const classroom = await call<{ id: number; campusName: string }>(
+    `window.api.createClassroom({ campusId: ${campus.id}, name: '101教室', capacity: 30, type: '普通', note: null, deviceInfo: '投影仪' })`
+  )
+  assert(classroom.id > 0 && classroom.campusName === '本部', '创建教室（含校区名联查）')
+  // 第二个课程挂在教室上
+  const course2 = await call<{ id: number; defaultClassroomName: string }>(
+    `window.api.createCourse({ subject: '英语', grade: '高一', className: 'B2班', defaultTeacherId: ${teacher.id}, scheduleRule: [{ weekday: 3, start: '15:00', end: '17:00' }], defaultClassroomId: ${classroom.id} })`
+  )
+  assert(course2.defaultClassroomName === '101教室', '课程关联默认教室')
+  // 教室冲突检测：同一教室同一时间段再建课
+  const roomConflicts = await call<{ type: string; who: string }[]>(
+    `window.api.checkCourseConflict({ courseId: null, defaultTeacherId: ${teacher.id}, scheduleRule: [{ weekday: 3, start: '16:00', end: '17:30' }], defaultClassroomId: ${classroom.id} })`
+  )
+  assert(roomConflicts.some((c) => c.type === 'classroom' && c.who === '101教室'), '教室时间冲突检测')
+  const utilization = await call<{ name: string; scheduledMinutes: number; rate: number }[]>(
+    `window.api.getClassroomUtilization('${today}', '${future}')`
+  )
+  const roomUtil = utilization.find((u) => u.name === '101教室')
+  assert(!!roomUtil && roomUtil.scheduledMinutes > 0 && roomUtil.rate > 0, '教室利用率统计（已排课时间>0）')
+  // 预置 v4 测试学生（教务身份创建，财务段使用）
+  await call(
+    `window.api.updateTeacher(${teacher.id}, { name: '张老师', note: null, courseIds: [${course.id}, ${course2.id}] })`
+  )
+  const student2 = await call<{ id: number }>(
+    `window.api.createStudent({ name: '小红', schoolClass: null, note: null, courseIds: [${course.id}] })`
+  )
+  const student3 = await call<{ id: number }>(
+    `window.api.createStudent({ name: '小刚', schoolClass: null, note: null, courseIds: [${course.id}] })`
+  )
+  await call(`window.api.logout()`)
+
+  // ---------- v4：财务个性化费用 / 课酬 / 退费转课 / 审计 / 分析 / 简报 / 备份 ----------
+  console.log('\n[8] 财务 v4：个性化费用 / 锁定 / 课酬差异化 / 退费转课 / 审计 / 分析 / 简报 / 备份')
+  await call(`window.api.login('finance', 'admin123')`)
+  // 个性化费用：单价 60、赠送 2 次 → 应缴 = max(0, 2-2) × 60 = 0
+  await call(
+    `window.api.upsertStudentCourseFee({ studentId: ${student.id}, courseId: ${course.id}, unitPrice: 60, discountType: 'gift', freeLessons: 2, note: '团报优惠' })`
+  )
+  assert((await call<unknown[]>(`window.api.getStudentCourseFees()`)).length === 1, '个性化费用设置')
+  await call(`window.api.autoCalcStudentPayments()`)
+  let sp1 = await call<{ id: number; studentId: number; amountDue: number; isLocked: number }[]>(`window.api.getStudentPayments()`)
+  let mine = sp1.find((p) => p.studentId === student.id)!
+  assert(mine.amountDue === 0 && mine.isLocked === 0, '应缴 = max(0, 计费次数−赠送) × 单价 = 0')
+  // 去掉赠送、改单价 80 → 应缴 = 2 × 80 = 160
+  await call(
+    `window.api.upsertStudentCourseFee({ studentId: ${student.id}, courseId: ${course.id}, unitPrice: 80, discountType: 'old_student', freeLessons: 0, note: '老生优惠' })`
+  )
+  await call(`window.api.autoCalcStudentPayments()`)
+  sp1 = await call<{ id: number; studentId: number; amountDue: number; isLocked: number }[]>(`window.api.getStudentPayments()`)
+  mine = sp1.find((p) => p.studentId === student.id)!
+  assert(mine.amountDue === 160, '应缴 = 计费次数(2) × 单价(80) = 160')
+  // 锁定后不自动更新
+  await call(`window.api.updateStudentPaymentLock(${mine.id}, true)`)
+  await call(
+    `window.api.upsertStudentCourseFee({ studentId: ${student.id}, courseId: ${course.id}, unitPrice: 999, discountType: 'none', freeLessons: 0, note: null })`
+  )
+  await call(`window.api.autoCalcStudentPayments()`)
+  sp1 = await call<{ id: number; studentId: number; amountDue: number; isLocked: number }[]>(`window.api.getStudentPayments()`)
+  mine = sp1.find((p) => p.studentId === student.id)!
+  assert(mine.amountDue === 160 && mine.isLocked === 1, '锁定记录不参与自动重算')
+  await call(`window.api.updateStudentPaymentLock(${mine.id}, false)`)
+  await call(
+    `window.api.upsertStudentCourseFee({ studentId: ${student.id}, courseId: ${course.id}, unitPrice: 80, discountType: 'none', freeLessons: 0, note: null })`
+  )
+  // 实缴自动锁定
+  await call(
+    `window.api.createStudentPayment({ studentId: ${student.id}, courseId: ${course.id}, amountDue: 160, amountPaid: 100, paymentMethod: '微信', paymentDate: '${today}', note: '首期' })`
+  )
+  const paidRecord = await call<{ isLocked: number }[]>(`window.api.getStudentPayments()`).then((r) =>
+    (r as unknown as { isLocked: number; amountPaid: number }[]).find((p) => p.amountPaid === 100)
+  )
+  assert(!!paidRecord && paidRecord.isLocked === 1, '有实缴的记录自动锁定')
+
+  // 课酬差异化：老师默认 60 → 应付 60；实例覆盖 45 → 该课次 45
+  await call(`window.api.updateTeacherRate(${teacher.id}, 60)`)
+  await call(`window.api.autoCalcTeacherPayments()`)
+  let tps = await call<{ amountDue: number; rateSource: string }[]>(`window.api.getTeacherPayments()`)
+  assert(tps.every((p) => p.amountDue === 60 && p.rateSource === 'teacher'), '应付取老师默认课酬（60，来源=teacher）')
+  await call(`window.api.updateInstanceRate(${instanceId}, 45)`)
+  await call(`window.api.autoCalcTeacherPayments()`)
+  tps = await call<{ amountDue: number; rateSource: string }[]>(`window.api.getTeacherPayments()`)
+  const instTp = tps.find((p) => (p as unknown as { scheduleInstanceId: number }).scheduleInstanceId === instanceId)
+  assert(!!instTp && instTp.amountDue === 45 && instTp.rateSource === 'instance', '实例覆盖课酬优先（45，来源=instance）')
+
+  // 暂停：不能考勤、不计费（小红/小刚已在教务段创建）
+  await call(`window.api.updateStudentCourseStatus(${student2.id}, ${course.id}, 'paused')`)
+  await call(`window.api.logout()`)
+  await call(`window.api.login('academic', 'admin123')`)
+  await assertRejected(
+    `window.api.saveAttendance({ scheduleInstanceId: ${instanceId}, studentId: ${student2.id}, status: 'present' })`,
+    '暂停学生不可操作考勤'
+  )
+  await call(`window.api.logout()`)
+  await call(`window.api.login('finance', 'admin123')`)
+
+  // 退费：先缴 100 → 退费 100（无消耗）
+  await call(
+    `window.api.createStudentPayment({ studentId: ${student2.id}, courseId: ${course.id}, amountDue: 0, amountPaid: 100, paymentMethod: '现金', paymentDate: '${today}', note: null })`
+  )
+  const refundRes = await call<{ refund: number }>(`window.api.refundStudentCourse(${student2.id}, ${course.id})`)
+  assert(refundRes.refund === 100, `退费计算正确（已缴100−已消耗0=退${refundRes.refund}）`)
+  await assertRejected(`window.api.refundStudentCourse(${student2.id}, ${course.id})`, '重复退费被拒绝')
+
+  // 转课：小刚 原课缴 100 → 转到 course2 补缴 100
+  await call(
+    `window.api.createStudentPayment({ studentId: ${student3.id}, courseId: ${course.id}, amountDue: 0, amountPaid: 100, paymentMethod: '转账', paymentDate: '${today}', note: null })`
+  )
+  const transferRes = await call<{ balance: number }>(`window.api.transferStudentCourse(${student3.id}, ${course.id}, ${course2.id}, null)`)
+  assert(transferRes.balance === 100, `转课余额结清（补缴 ${transferRes.balance}）`)
+  const student3Info = await call<{ id: number; courseIds: number[] }[]>(`window.api.getStudents()`).then((r) =>
+    r.find((s) => s.id === student3.id)
+  )
+  assert(student3Info!.courseIds.includes(course2.id), '转课后新课程自动关联')
+
+  // 审计日志
+  const logs = await call<{ action: string }[]>(`window.api.getAuditLogs({ limit: 500 })`)
+  assert(logs.some((l) => l.action === 'refund') && logs.some((l) => l.action === 'transfer') && logs.some((l) => l.action === 'update_student_fee'), '审计日志记录退费/转课/费用修改')
+  const refundLogs = await call<{ action: string }[]>(`window.api.getAuditLogs({ action: 'refund', limit: 10 })`)
+  assert(refundLogs.length === 1 && refundLogs[0].action === 'refund', '审计日志按操作类型筛选')
+
+  // 经营分析数据
+  const analytics = await call<{ trend: unknown[]; incomeByMethod: { name: string; value: number }[]; expenseByTeacher: { name: string }[] }>(
+    `window.api.getAnalytics({ granularity: 'month', start: '${today}', end: '${future}' })`
+  )
+  assert(analytics.trend.length >= 1, '经营分析趋势数据')
+  assert(analytics.incomeByMethod.some((x) => x.name === '微信'), '收入按缴费方式构成')
+  assert(analytics.expenseByTeacher.some((x) => x.name.includes('张老师')), '支出按老师构成')
+
+  // 老师简报
+  const brief = await call<{ teacher: { name: string }; students: unknown[]; compensation: unknown }>(
+    `window.api.getTeacherBriefData({ teacherId: ${teacher.id}, start: '${today}', end: '${future}', includeCompensation: false })`
+  )
+  assert(brief.teacher.name === '张老师' && brief.students.length >= 1 && brief.compensation === null, '老师简报（不含课酬）')
+  const brief2 = await call<{ compensation: { due: number } | null }>(
+    `window.api.getTeacherBriefData({ teacherId: ${teacher.id}, start: '${today}', end: '${future}', includeCompensation: true })`
+  )
+  assert(brief2.compensation !== null && brief2.compensation.due > 0, '老师简报（含课酬汇总）')
+
+  // 定时备份与系统通知
+  const backupRes = await call<{ success: boolean; files: string[] }>(`window.api.runBackupNow()`)
+  assert(backupRes.success && backupRes.files.length === 3, '手动触发备份（3 个数据库文件）')
+  const notifications = await call<{ title: string }[]>(`window.api.getSystemNotifications()`)
+  assert(notifications.some((n) => n.title.includes('自动备份')), '备份结果写入系统通知')
+  await call(
+    `window.api.saveBackupConfig({ enabled: true, dir: '${path.join(os.tmpdir(), 'vlearn-bak-cfg').replace(/\\/g, '/')}', day: 0, hour: 3, keep: 4 })`
+  )
+  const bakCfg = await call<{ keep: number }>(`window.api.getBackupConfig()`)
+  assert(bakCfg.keep === 4, '备份设置保存与读取')
+  await call(`window.api.logout()`)
+
   // ---------- 多校区同步 ----------
-  console.log('\n[7] 多校区同步')
+  console.log('\n[9] 多校区同步')
   // 真实时序：先创建"待删除学生"并导出包1（此时该生存在）→ 再删除并导出包2（含墓碑）
   await call(`window.api.logout()`)
   await call(`window.api.login('academic', 'admin123')`)
@@ -443,10 +600,12 @@ export async function runUiSmokeTest(): Promise<void> {
   await shot('02-教务-课程日历.png')
   await clickMenu('学生管理')
   await shot('03-教务-学生管理.png')
+  await clickMenu('资源管理')
+  await shot('04-教务-资源管理.png')
   await clickMenu('系统设置')
-  await shot('04-教务-系统设置.png')
+  await shot('05-教务-系统设置.png')
   await clickMenu('多校区同步')
-  await shot('05-教务-多校区同步.png')
+  await shot('06-教务-多校区同步.png')
 
   // 3) 财务主界面
   await loginAs('finance')
@@ -454,7 +613,9 @@ export async function runUiSmokeTest(): Promise<void> {
     `({ hasMenu: document.body.innerText.includes('仪表盘') && document.body.innerText.includes('盈亏报表'), hasRole: document.body.innerText.includes('财务端') })`
   )
   assert(finCheck.hasMenu && finCheck.hasRole, '财务主界面（菜单 + 角色标识）')
-  await shot('05-财务-仪表盘.png')
+  await shot('07-财务-仪表盘.png')
+  await clickMenu('经营分析')
+  await shot('08-财务-经营分析.png')
 
   // 4) 助教主界面
   await loginAs('assistant')
@@ -463,7 +624,7 @@ export async function runUiSmokeTest(): Promise<void> {
   )
   assert(astCheck.hasMenu && astCheck.hasRole, '助教主界面（菜单 + 角色标识）')
   await clickMenu('课程内容记录')
-  await shot('06-助教-课程内容记录.png')
+  await shot('09-助教-课程内容记录.png')
 
   const realErrors = consoleErrors.filter((m) => !m.includes('DevTools'))
   assert(realErrors.length === 0, `无渲染进程错误${realErrors.length > 0 ? '：' + realErrors.join(' | ') : ''}`)

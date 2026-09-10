@@ -18,14 +18,18 @@ import {
   Space,
   Spin,
   Switch,
+  Table,
+  Tag,
   Typography
 } from 'antd'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api, getErrorMessage, tryApi } from '../api'
 import { useRole } from '../roleContext'
 import type {
   AcademicSettings,
   AssistantSettings,
+  AuditLogEntry,
+  BackupConfigInfo,
   FinanceSettings,
   RoleSettings
 } from '../types'
@@ -545,6 +549,281 @@ function BackupCard(): JSX.Element {
   )
 }
 
+/** 操作日志动作中文映射（与主进程审计动作一致，未知动作原样展示） */
+const AUDIT_ACTION_LABELS: Record<string, string> = {
+  update_student_fee: '修改个性化费用',
+  delete_student_fee: '删除个性化费用',
+  update_payment: '修改缴费记录',
+  lock_payment: '锁定记录',
+  unlock_payment: '解锁记录',
+  update_teacher_rate: '修改老师课酬',
+  update_instance_rate: '修改课次课酬',
+  update_course_status: '修改课程状态',
+  refund: '退费',
+  transfer: '转课'
+}
+
+/**
+ * 操作日志（仅财务角色）：财务模块的所有费用修改操作自动记录，
+ * 此处展示最近 200 条审计记录，用于财务审计追溯。
+ */
+function AuditLogCard(): JSX.Element {
+  const { message } = AntdApp.useApp()
+  const [logs, setLogs] = useState<AuditLogEntry[]>([])
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async (): Promise<void> => {
+    setLoading(true)
+    try {
+      const rows = await api.getAuditLogs({ limit: 200 })
+      setLogs(rows)
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [message])
+
+  // 财务角色进入设置页时加载（页面随菜单切换重新挂载，天然保证每次进入刷新）
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const columns = [
+    { title: '时间', dataIndex: 'createdAt', key: 'createdAt', width: 160 },
+    {
+      title: '操作',
+      dataIndex: 'action',
+      key: 'action',
+      width: 150,
+      render: (v: string) => <Tag color="blue">{AUDIT_ACTION_LABELS[v] ?? v}</Tag>
+    },
+    {
+      title: '对象',
+      key: 'target',
+      width: 130,
+      render: (_: unknown, row: AuditLogEntry) => (
+        <Typography.Text>
+          {row.targetType} #{row.targetId}
+        </Typography.Text>
+      )
+    },
+    {
+      title: '修改前',
+      dataIndex: 'oldValue',
+      key: 'oldValue',
+      width: 200,
+      ellipsis: true,
+      render: (v: string | null) => v || '—'
+    },
+    {
+      title: '修改后',
+      dataIndex: 'newValue',
+      key: 'newValue',
+      width: 200,
+      ellipsis: true,
+      render: (v: string | null) => v || '—'
+    },
+    {
+      title: '操作者',
+      key: 'operator',
+      width: 100,
+      render: (_: unknown, row: AuditLogEntry) =>
+        (row as AuditLogEntry & { operator?: string }).operator || '—'
+    }
+  ]
+
+  return (
+    <Card title="操作日志" style={{ marginBottom: 16 }}>
+      <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+        所有费用修改操作均自动记录，用于财务审计。
+      </Typography.Paragraph>
+      <Table
+        size="small"
+        rowKey="id"
+        loading={loading}
+        columns={columns}
+        dataSource={logs}
+        scroll={{ x: 940 }}
+        pagination={{ pageSize: 20, showTotal: (total) => `共 ${total} 条记录` }}
+      />
+    </Card>
+  )
+}
+
+/** 备份周期选项：day 0=周日 … 6=周六 */
+const BACKUP_WEEKDAY_OPTIONS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'].map(
+  (label, value) => ({ value, label: `每周${label}` })
+)
+
+/** 备份时间选项：整点执行 */
+const BACKUP_HOUR_OPTIONS = Array.from({ length: 24 }, (_, h) => ({
+  value: h,
+  label: `${String(h).padStart(2, '0')}:00`
+}))
+
+/**
+ * 备份设置（所有角色）：定时自动备份的周期 / 保留份数 / 目录，
+ * 提供"立即备份"手动触发与上次备份状态展示。
+ * 系统未提供目录选择 IPC，备份目录由用户手动填写路径。
+ */
+function BackupSettingsCard(): JSX.Element {
+  const { message } = AntdApp.useApp()
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [backingUp, setBackingUp] = useState(false)
+  // 备份配置字段（加载前用默认值兜底展示，后端读取失败不阻塞整页）
+  const [enabled, setEnabled] = useState(true)
+  const [dir, setDir] = useState('')
+  const [day, setDay] = useState(0)
+  const [hour, setHour] = useState(3)
+  const [keep, setKeep] = useState(4)
+  const [lastBackupTime, setLastBackupTime] = useState<string | null>(null)
+  const [lastBackupStatus, setLastBackupStatus] = useState<string | null>(null)
+
+  /** 读取当前备份配置与上次备份状态 */
+  const refresh = useCallback(async (): Promise<void> => {
+    setLoading(true)
+    try {
+      const cfg: BackupConfigInfo = await api.getBackupConfig()
+      setEnabled(cfg.enabled)
+      setDir(cfg.dir)
+      setDay(cfg.day)
+      setHour(cfg.hour)
+      setKeep(cfg.keep)
+      setLastBackupTime(cfg.lastBackupTime)
+      setLastBackupStatus(cfg.lastBackupStatus)
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [message])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+
+  const handleSave = async (): Promise<void> => {
+    const dirValue = dir.trim()
+    if (!dirValue) {
+      message.error('请填写备份目录')
+      return
+    }
+    setSaving(true)
+    try {
+      await api.saveBackupConfig({ enabled, dir: dirValue, day, hour, keep })
+      message.success('备份设置已保存')
+      await refresh()
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleRunNow = async (): Promise<void> => {
+    setBackingUp(true)
+    try {
+      const res = await api.runBackupNow()
+      if (res.success) {
+        message.success('备份完成')
+      } else {
+        message.error(res.error ?? '备份失败')
+      }
+      // 备份后刷新，更新"上次备份"时间与状态
+      await refresh()
+    } catch (err) {
+      message.error(getErrorMessage(err))
+    } finally {
+      setBackingUp(false)
+    }
+  }
+
+  /** 上次备份状态展示：success=成功；"失败：…"红色；从未备份为 — */
+  let statusNode: JSX.Element
+  if (lastBackupStatus === null) {
+    statusNode = <Typography.Text type="secondary">—</Typography.Text>
+  } else if (lastBackupStatus === 'success') {
+    statusNode = <Typography.Text style={{ color: '#52c41a' }}>成功</Typography.Text>
+  } else {
+    statusNode = <Typography.Text type="danger">{lastBackupStatus}</Typography.Text>
+  }
+
+  return (
+    <Card title="备份设置" style={{ marginBottom: 16 }}>
+      <div style={{ maxWidth: 560 }}>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          备份内容为教务 / 财务 / 助教三个数据库文件，按配置自动执行；保留最近 N 份，更旧的自动删除。
+        </Typography.Paragraph>
+        <Spin spinning={loading}>
+          <div style={{ marginBottom: 20 }}>
+            <FieldLabel text="启用自动备份" />
+            <Switch
+              checked={enabled}
+              checkedChildren="开启"
+              unCheckedChildren="关闭"
+              onChange={(v: boolean) => setEnabled(v)}
+            />
+            <FieldHint text="关闭后仅可手动备份（「立即备份」按钮），不再按周期自动执行。" />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <FieldLabel text="备份周期" />
+            <Space>
+              <Select
+                style={{ width: 120 }}
+                value={day}
+                onChange={(v: number) => setDay(v)}
+                options={BACKUP_WEEKDAY_OPTIONS}
+              />
+              <Select
+                style={{ width: 100 }}
+                value={hour}
+                onChange={(v: number) => setHour(v)}
+                options={BACKUP_HOUR_OPTIONS}
+              />
+            </Space>
+            <FieldHint text="每周固定日期整点执行；应用启动时若发现超过一个周期未备份会自动补做。" />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <FieldLabel text="保留份数" />
+            <InputNumber
+              min={1}
+              max={52}
+              precision={0}
+              value={keep}
+              onChange={(v: number | null) => setKeep(v ?? 4)}
+              addonAfter="份"
+              style={{ width: 200 }}
+            />
+            <FieldHint text="按 数据库名_时间戳.db 命名，超出保留份数的旧备份自动删除（范围 1-52 份）。" />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <FieldLabel text="备份目录" />
+            <Input
+              placeholder="如 /Users/你的用户名/VlearnBackups 或 D:\VlearnBackups"
+              value={dir}
+              onChange={(e) => setDir(e.target.value)}
+            />
+            <FieldHint text="手动填写存放备份文件的目录路径（应用需具备写入权限），三个数据库将分别保存为独立的 .db 文件。" />
+          </div>
+        </Spin>
+        <Space>
+          <Button type="primary" loading={saving} onClick={() => void handleSave()}>
+            保存设置
+          </Button>
+          <Button loading={backingUp} onClick={() => void handleRunNow()}>
+            立即备份
+          </Button>
+        </Space>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 0, marginTop: 12 }}>
+          上次备份：{lastBackupTime ?? '从未'}　状态：{statusNode}
+        </Typography.Paragraph>
+      </div>
+    </Card>
+  )
+}
+
 /** 关于：应用名称与版本 */
 function AboutCard({ appVersion }: { appVersion: string }): JSX.Element {
   return (
@@ -607,7 +886,9 @@ export default function SettingsPage(): JSX.Element {
             <FinanceBaseCard settings={financeSettings} onChange={(s) => setSettings(s)} />
             <FinanceAgentCard settings={financeSettings} onChange={(s) => setSettings(s)} />
             <PasswordCard hint={DEFAULT_PASSWORD_HINTS.finance} />
+            <AuditLogCard />
             <BackupCard />
+            <BackupSettingsCard />
             <AboutCard appVersion={appVersion} />
           </>
         ) : currentRole === 'assistant' ? (
@@ -615,6 +896,7 @@ export default function SettingsPage(): JSX.Element {
             <AssistantApiCard settings={assistantSettings} onChange={(s) => setSettings(s)} />
             <PasswordCard hint={DEFAULT_PASSWORD_HINTS.assistant} />
             <BackupCard />
+            <BackupSettingsCard />
             <AboutCard appVersion={appVersion} />
           </>
         ) : (
@@ -623,6 +905,7 @@ export default function SettingsPage(): JSX.Element {
             <AcademicAgentCard settings={academicSettings} onChange={(s) => setSettings(s)} />
             <PasswordCard hint={DEFAULT_PASSWORD_HINTS.academic} />
             <BackupCard />
+            <BackupSettingsCard />
             <AboutCard appVersion={appVersion} />
           </>
         )}

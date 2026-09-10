@@ -6,6 +6,8 @@
 
 **v3 特性**：Agent 提示词集中管理与调优（微信群短信语言优化 + 下次上课预告）；**多校区信息同步**（人工同步包：全量快照 + 删除墓碑 + 跨校区 id 冲突自动重映射，财务数据与密钥不参与同步）。
 
+**v4 特性**：学生个性化费用（单价/折扣类型/赠送课时，应缴 = max(0, 计费次数−赠送) × 单价）与缴费记录锁定；老师课酬差异化（实例覆盖 > 老师默认 > 课程标准，来源可溯源）；退费/转课/暂停等学生课程状态管理；费用操作审计日志；**经营分析**图表页（趋势/收入构成/支出构成 + 下钻明细）；**老师简报**（财务生成转发老师，可选含课酬，PDF/文本导出）；**校区与教室资源管理**（教室参与排课冲突检测 + 利用率统计）；**定时备份**（每周自动 + 启动补备份 + 保留 N 份 + 系统通知）。
+
 > 面向普通用户的操作指南见 [使用说明书.md](./使用说明书.md)。
 
 ## 技术栈
@@ -31,6 +33,7 @@
 │   ├── ai.ts                    # OpenAI 兼容大模型客户端（30s 超时、错误归一化）
 │   ├── prompts.ts               # 全部生成文本的系统提示词（集中调优）
 │   ├── sync.ts                  # 多校区同步引擎（快照导出/合并导入/墓碑/重映射）
+│   ├── backupScheduler.ts        # 定时备份调度器（每周自动 + 启动补备份 + 保留策略 + 系统通知）
 │   ├── agent.ts                 # 教务/财务 Agent 逻辑（本地规则检测 + 可选 LLM 文本生成）
 │   ├── schedule.ts              # 排课生成算法
 │   ├── ipcHandlers.ts           # 全部 IPC 处理器（每个通道严格角色校验 + 跨库只读/清理）
@@ -45,7 +48,9 @@
 │   │                            # ReportsCenterPage（教务报告）、SettingsPage（按角色分节）、
 │   │                            # FinanceDashboard、CourseFees、Student/TeacherPayments、Reports、
 │   │                            # LessonNotesPage、HistoryMessagesPage（助教）、
-│   │                            # SyncPage（多校区同步）
+│   │                            # SyncPage（多校区同步）、BusinessAnalyticsPage（经营分析）、
+│   │                            # TeacherBriefsPage（老师简报）、ResourcesPage（校区/教室）、
+│   │                            # ClassroomUtilizationPage（教室利用率）
 │   └── components/              # AgentSidebar、LessonNoteEditorModal、InstanceDetailModal、
 │                                # CourseManagerModal、PageToolbar、ExportExcelButton 等
 ├── scripts/rebuild-native.js    # postinstall：better-sqlite3 → Electron ABI（支持镜像）
@@ -112,6 +117,9 @@ npm run dist       # 打包当前平台安装包（release/）
 | Agent | `agent:getAlerts`（教务/财务）`agent:checkCourseConflict` `agent:checkInstanceConflict` `agent:suggestSlots` `agent:checkDuplicateName` `agent:generateReport`（教务）`agent:reconcile` `agent:checkPaymentAnomaly` `agent:trendAnalysis` `agent:smartReport`（财务） | 按角色 |
 | 设置/备份/导出 | `settings:get` `settings:save`（按角色分节）`app:getVersion` `backup:create` `backup:restore` `export:excel` | 任意已登录角色 |
 | 多校区同步 | `sync:getInfo` `sync:saveCampusName` `sync:exportPackage` `sync:importPackage` | 教务/助教 |
+| 财务 v4 | `finance:getStudentCourseFees` `finance:upsertStudentCourseFee` `finance:deleteStudentCourseFee` `finance:updateStudentPaymentLock` `finance:updateTeacherRate` `finance:updateInstanceRate` `finance:updateStudentCourseStatus` `finance:refundStudentCourse` `finance:transferStudentCourse` `finance:getAuditLogs` `finance:getAnalytics` `finance:getTeacherBriefData` `brief:exportPdf` | 仅财务 |
+| 资源 | `campuses:getAll/create/update/delete` `classrooms:getAll/create/update/delete` `classrooms:getUtilization` | 读三角色，写仅教务 |
+| 备份 | `backup:getConfig` `backup:saveConfig` `backup:runNow` `notifications:getRecent` | 任意已登录角色 |
 
 ### 多校区同步（v3）
 
@@ -129,7 +137,9 @@ npm run dist       # 打包当前平台安装包（release/）
 ### 业务规则
 
 - **排课**：课程创建按 `default_schedule_rule` 自动生成未来 N 周实例；修改规则不自动更新已有实例，可"重新生成排课"（仅重建今天及未来，历史保留）。
-- **应缴** = 课程费用 × 计费出勤次数（出勤必计费、请假免费、缺勤按财务设置 `charge_absent`）；**应付** = 单次课酬标准（代课付给代课老师）。
+- **应缴（v4）** = max(0, 计费次数 − 赠送课时) × 个性化单价（未设置个性化费用则用课程费用）；计费次数 = 出勤 +（按设置的缺勤）；已锁定记录（有实缴或手动锁定）不参与自动重算。**退费** = 已缴 − 已消耗（消耗按同一公式）；**转课**余额正补负退。
+- **应付（v4）** 优先级：课次覆盖 actual_rate → 老师默认课酬 default_rate_per_lesson → 课程单次课酬 pay_per_session（来源记录于 rate_source，代课付给代课老师）。
+- 学生课程状态：active/paused（暂停不考勤不计费）/refunded/completed/transferred；所有费用修改写入 finance_audit_logs。
 - **盈亏** = 学生实缴 − 老师实付，按月统计（`payment_date` 所在月份）。
 
 ### 各角色库 `settings` 表关键键
@@ -146,7 +156,7 @@ npm run dist       # 打包当前平台安装包（release/）
 ## 测试
 
 ```bash
-npm run smoke      # 迁移验证 + 三角色登录/越权拦截 + 全流程 + Agent + 多校区同步（73 项断言）
+npm run smoke      # 迁移 + 三角色/越权 + 全流程 + Agent + 同步 + v4（个性化费用/退费转课/教室冲突/备份等）
 npm run smoke:ui   # 登录页渲染、三个角色登录后主界面渲染、无渲染进程错误
 ```
 
@@ -176,3 +186,4 @@ npm run smoke:ui   # 登录页渲染、三个角色登录后主界面渲染、�
 | 助教"生成微信群短信"报错 | 未配置 API 或网络不通：助教设置 → 大模型 API 配置 |
 | 报告显示"系统模板" | 未配置大模型 API 时的正常回退，配置后自动变为 AI 润色 |
 | 多校区怎么共享数据 | 菜单"多校区同步"→ 导出同步包 → 微信发对方 → 对方导入（财务数据不参与同步） |
+| 自动备份在哪配置 | 系统设置 → 备份设置（周期/目录/保留份数，备份结果在右侧面板"系统通知"） |

@@ -52,15 +52,20 @@ interface InstanceRow {
   default_teacher_id: number | null
   default_teacher_name: string | null
   actual_teacher_name: string | null
+  classroom_id: number | null
+  classroom_name: string | null
+  default_classroom_id: number | null
 }
 
 const INSTANCE_SELECT = `
-  SELECT si.*, c.subject, c.grade, c.class_name, c.default_teacher_id,
-         def.name AS default_teacher_name, act.name AS actual_teacher_name
+  SELECT si.*, c.subject, c.grade, c.class_name, c.default_teacher_id, c.default_classroom_id,
+         def.name AS default_teacher_name, act.name AS actual_teacher_name,
+         cr.name AS classroom_name
   FROM schedule_instances si
   JOIN courses c ON c.id = si.course_id
   LEFT JOIN teachers def ON def.id = c.default_teacher_id
   LEFT JOIN teachers act ON act.id = si.actual_teacher_id
+  LEFT JOIN classrooms cr ON cr.id = COALESCE(si.classroom_id, c.default_classroom_id)
 `
 
 /** 课程标签 */
@@ -213,21 +218,31 @@ export function getAcademicAlerts(): AgentAlert[] {
   return alerts
 }
 
-/** 新增/编辑课程时的排课冲突检测（默认老师 + 未来 8 周规则生成日期） */
+/** 新增/编辑课程时的排课冲突检测（默认老师 + 默认教室 + 未来 8 周规则生成日期） */
 export function checkCourseConflict(payload: {
   courseId: number | null
   defaultTeacherId: number | null
   scheduleRule: ScheduleRule[]
+  defaultClassroomId?: number | null
 }): ConflictItem[] {
   if ((getSettingValue('academic', 'agent_conflict_detect') ?? '1') !== '1') return []
   const teacherId = payload.defaultTeacherId
-  if (teacherId === null || teacherId === undefined) return []
+  const classroomId = payload.defaultClassroomId ?? null
+  if ((teacherId === null || teacherId === undefined) && classroomId === null) return []
   const weeks = parseInt(getSettingValue('academic', 'schedule_weeks') ?? '8', 10) || 8
   const rules = payload.scheduleRule ?? []
 
   // 生成未来 N 周（日期, 起止时间）组合
   const now = new Date()
   const conflicts: ConflictItem[] = []
+  const seen = new Set<string>()
+  const push = (item: ConflictItem): void => {
+    const key = `${item.type}-${item.who}-${item.courseLabel}-${item.date}-${item.startTime}`
+    if (!seen.has(key)) {
+      seen.add(key)
+      conflicts.push(item)
+    }
+  }
   for (const rule of rules) {
     // 与 schedule.ts 生成算法一致的日期推算（简化：逐日扫描未来 weeks*7 天）
     for (let d = 0; d < weeks * 7; d++) {
@@ -235,32 +250,59 @@ export function checkCourseConflict(payload: {
       const weekday = day.getDay() === 0 ? 7 : day.getDay() // 1=周一…7=周日
       if (weekday !== rule.weekday) continue
       const dateStr = format(day, 'yyyy-MM-dd')
-      const clash = teacherInstances(teacherId, undefined, payload.courseId ?? undefined).filter(
-        (i) => i.date === dateStr && i.status !== 'cancelled' && overlapTime(rule.start, rule.end, i.start_time, i.end_time)
-      )
-      for (const c of clash) {
-        conflicts.push({
-          type: 'teacher',
-          who: c.actual_teacher_name ?? c.default_teacher_name ?? '老师',
-          courseLabel: label(c.subject, c.grade, c.class_name),
-          date: c.date,
-          startTime: c.start_time,
-          endTime: c.end_time,
-          reason: '时间重叠'
-        })
+      // 老师冲突
+      if (teacherId !== null && teacherId !== undefined) {
+        const clash = teacherInstances(teacherId, undefined, payload.courseId ?? undefined).filter(
+          (i) => i.date === dateStr && i.status !== 'cancelled' && overlapTime(rule.start, rule.end, i.start_time, i.end_time)
+        )
+        for (const c of clash) {
+          push({
+            type: 'teacher',
+            who: c.actual_teacher_name ?? c.default_teacher_name ?? '老师',
+            courseLabel: label(c.subject, c.grade, c.class_name),
+            date: c.date,
+            startTime: c.start_time,
+            endTime: c.end_time,
+            reason: '时间重叠'
+          })
+        }
+      }
+      // 教室冲突（同一教室同一时间不可安排两门课）
+      if (classroomId !== null) {
+        const clash = getDb('academic')
+          .prepare(
+            `${INSTANCE_SELECT} WHERE si.status != 'cancelled' AND si.date = ?
+             AND COALESCE(si.classroom_id, c.default_classroom_id) = ?
+             ${payload.courseId !== null ? ' AND si.course_id != ?' : ''}`
+          )
+          .all(dateStr, classroomId, ...(payload.courseId !== null ? [payload.courseId] : [])) as InstanceRow[]
+        for (const c of clash) {
+          if (overlapTime(rule.start, rule.end, c.start_time, c.end_time)) {
+            push({
+              type: 'classroom',
+              who: c.classroom_name ?? '教室',
+              courseLabel: label(c.subject, c.grade, c.class_name),
+              date: c.date,
+              startTime: c.start_time,
+              endTime: c.end_time,
+              reason: '教室时间冲突'
+            })
+          }
+        }
       }
     }
   }
   return conflicts
 }
 
-/** 单次调课冲突检测（老师 + 报名学生） */
+/** 单次调课冲突检测（老师 + 报名学生 + 教室） */
 export function checkInstanceConflict(payload: {
   instanceId: number
   date: string
   startTime: string
   endTime: string
   actualTeacherId: number | null
+  classroomId?: number | null
 }): ConflictItem[] {
   if ((getSettingValue('academic', 'agent_conflict_detect') ?? '1') !== '1') return []
   const inst = getDb('academic')
@@ -285,6 +327,30 @@ export function checkInstanceConflict(payload: {
         endTime: c.end_time,
         reason: '时间重叠'
       })
+    }
+  }
+
+  // 教室冲突（同一教室同一时间不可安排两门课；教室可取实例覆盖值或课程默认值）
+  const classroomId = payload.classroomId ?? inst.classroom_id ?? inst.default_classroom_id
+  if (classroomId !== null && classroomId !== undefined) {
+    const clash = getDb('academic')
+      .prepare(
+        `${INSTANCE_SELECT} WHERE si.status != 'cancelled' AND si.id != ? AND si.date = ?
+         AND COALESCE(si.classroom_id, c.default_classroom_id) = ?`
+      )
+      .all(payload.instanceId, payload.date, classroomId) as InstanceRow[]
+    for (const c of clash) {
+      if (overlapTime(payload.startTime, payload.endTime, c.start_time, c.end_time)) {
+        conflicts.push({
+          type: 'classroom',
+          who: c.classroom_name ?? '教室',
+          courseLabel: label(c.subject, c.grade, c.class_name),
+          date: c.date,
+          startTime: c.start_time,
+          endTime: c.end_time,
+          reason: '教室时间冲突'
+        })
+      }
     }
   }
 
